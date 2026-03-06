@@ -7,6 +7,11 @@ on:
         description: "Optional image tag. Defaults to UTC YYMMDD-HHMM if empty."
         required: false
         type: string
+      mark_latest:
+        description: "Also publish the multi-arch image as latest."
+        required: false
+        default: true
+        type: boolean
 
 permissions:
   contents: read
@@ -208,5 +213,14 @@ jobs:
         run: |
           docker buildx imagetools create \
             --tag "${{ needs.meta.outputs.image }}:${{ needs.meta.outputs.version }}" \
+            "${{ needs.meta.outputs.image }}:${{ needs.meta.outputs.version }}-linux-amd64" \
+            "${{ needs.meta.outputs.image }}:${{ needs.meta.outputs.version }}-linux-arm64"
+
+      - name: Mark multi-arch image as latest
+        if: ${{ inputs.mark_latest }}
+        shell: bash
+        run: |
+          docker buildx imagetools create \
+            --tag "${{ needs.meta.outputs.image }}:latest" \
             "${{ needs.meta.outputs.image }}:${{ needs.meta.outputs.version }}-linux-amd64" \
             "${{ needs.meta.outputs.image }}:${{ needs.meta.outputs.version }}-linux-arm64"
