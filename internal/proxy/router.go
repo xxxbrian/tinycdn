@@ -3,6 +3,7 @@ package proxy
 import (
 	"net/http"
 	"slices"
+	"strings"
 
 	"github.com/darkweak/souin/configurationtypes"
 	souinmiddleware "github.com/darkweak/souin/pkg/middleware"
@@ -88,6 +89,7 @@ func (f *internalHeaderFilter) WriteHeader(statusCode int) {
 	}
 
 	restoreClientCacheControl(f.header)
+	f.header.Set(runtime.HeaderTinyCDNCache, deriveTinyCDNCache(f.header, statusCode))
 
 	for key, values := range f.header {
 		if isInternalCacheHeader(key) {
@@ -143,4 +145,27 @@ func isInternalCacheHeader(headerName string) bool {
 		runtime.HeaderSurrogateControl,
 		runtime.HeaderCDNCacheControl,
 	}, headerName)
+}
+
+func deriveTinyCDNCache(header http.Header, statusCode int) string {
+	cacheStatus := strings.ToLower(header.Get("Cache-Status"))
+
+	switch {
+	case strings.Contains(cacheStatus, "detail=serve-http-error"),
+		strings.Contains(cacheStatus, "detail=deadline-exceeded"):
+		return "ERROR"
+	case strings.Contains(cacheStatus, "fwd=stale"):
+		return "STALE"
+	case strings.Contains(cacheStatus, "; hit"):
+		return "HIT"
+	case strings.Contains(cacheStatus, "fwd=bypass"):
+		return "BYPASS"
+	case strings.Contains(cacheStatus, "fwd=uri-miss"),
+		strings.Contains(cacheStatus, "fwd=request"):
+		return "MISS"
+	case statusCode >= http.StatusInternalServerError:
+		return "ERROR"
+	default:
+		return "MISS"
+	}
 }

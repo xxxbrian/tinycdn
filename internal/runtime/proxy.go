@@ -10,6 +10,7 @@ import (
 )
 
 const (
+	HeaderTinyCDNCache             = "X-TinyCDN-Cache"
 	HeaderClientCacheControl       = "X-TinyCDN-Client-Cache-Control"
 	HeaderClientCacheControlAbsent = "X-TinyCDN-Client-Cache-Control-Absent"
 	HeaderSouinCacheControl        = "Souin-Cache-Control"
