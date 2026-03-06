@@ -13,6 +13,7 @@ RUN groupadd --system tinycdn \
 
 COPY ${BINARY_PATH} /app/tinycdn
 COPY ${WEB_PATH}/ /app/web/dist/
+RUN chmod 0755 /app/tinycdn && chown -R tinycdn:tinycdn /app
 
 USER tinycdn
 
