@@ -1,0 +1,11 @@
+.git
+.github
+.vscode
+data
+dist
+!dist/release
+!dist/release/**
+node_modules
+web/node_modules
+web/dist
+*.md

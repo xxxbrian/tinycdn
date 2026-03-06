@@ -1,0 +1,209 @@
+name: Publish Docker Image
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Optional image tag. Defaults to UTC YYMMDD-HHMM if empty."
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  meta:
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up mise
+        uses: jdx/mise-action@v3
+        with:
+          cache: true
+
+      - name: Set image metadata
+        id: meta
+        shell: bash
+        run: |
+          owner="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          repo="$(echo "${GITHUB_REPOSITORY#*/}" | tr '[:upper:]' '[:lower:]')"
+          if [ -n "${{ inputs.version }}" ]; then
+            version="${{ inputs.version }}"
+          else
+            version="$(date -u +'%y%m%d-%H%M')"
+          fi
+          image="${REGISTRY}/${owner}/${repo}"
+          echo "image=${image}" >> "${GITHUB_OUTPUT}"
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+
+  build-web:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up mise
+        uses: jdx/mise-action@v3
+        with:
+          cache: true
+
+      - name: Determine pnpm store path
+        id: pnpm-store
+        shell: bash
+        run: echo "path=$(pnpm store path --silent)" >> "${GITHUB_OUTPUT}"
+
+      - name: Restore pnpm store cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.pnpm-store.outputs.path }}
+          key: ${{ runner.os }}-pnpm-${{ hashFiles('web/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pnpm-
+
+      - name: Build release web assets
+        run: RELEASE_WEB_DIR=./dist/release/web mise run release:web
+
+      - name: Upload web artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: dist/release/web
+          if-no-files-found: error
+
+  build-binary:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            goarch: amd64
+            tag_suffix: linux-amd64
+          - platform: linux/arm64
+            goarch: arm64
+            tag_suffix: linux-arm64
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up mise
+        uses: jdx/mise-action@v3
+        with:
+          cache: true
+
+      - name: Restore Go caches
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ matrix.goarch }}-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-${{ matrix.goarch }}-
+            ${{ runner.os }}-go-
+
+      - name: Build release binary
+        run: RELEASE_GOOS=linux RELEASE_GOARCH=${{ matrix.goarch }} RELEASE_BIN_PATH=./dist/release/${{ matrix.tag_suffix }}/tinycdn mise run release:go
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tinycdn-${{ matrix.tag_suffix }}
+          path: dist/release/${{ matrix.tag_suffix }}/tinycdn
+          if-no-files-found: error
+
+  publish:
+    runs-on: ubuntu-latest
+    needs:
+      - meta
+      - build-web
+      - build-binary
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            arch: amd64
+            tag_suffix: linux-amd64
+          - platform: linux/arm64
+            arch: arm64
+            tag_suffix: linux-arm64
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Download web artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: dist/release/web
+
+      - name: Download binary artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tinycdn-${{ matrix.tag_suffix }}
+          path: dist/release/${{ matrix.tag_suffix }}
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            BINARY_PATH=dist/release/${{ matrix.tag_suffix }}/tinycdn
+            WEB_PATH=dist/release/web
+          tags: ${{ needs.meta.outputs.image }}:${{ needs.meta.outputs.version }}-${{ matrix.tag_suffix }}
+          cache-from: type=gha,scope=publish-${{ matrix.tag_suffix }}
+          cache-to: type=gha,mode=max,scope=publish-${{ matrix.tag_suffix }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ needs.meta.outputs.version }}
+
+  merge:
+    runs-on: ubuntu-latest
+    needs:
+      - meta
+      - publish
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create multi-arch manifest
+        shell: bash
+        run: |
+          docker buildx imagetools create \
+            --tag "${{ needs.meta.outputs.image }}:${{ needs.meta.outputs.version }}" \
+            "${{ needs.meta.outputs.image }}:${{ needs.meta.outputs.version }}-linux-amd64" \
+            "${{ needs.meta.outputs.image }}:${{ needs.meta.outputs.version }}-linux-arm64"

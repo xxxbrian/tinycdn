@@ -1,3 +1,8 @@
+[tools]
+go = "1.26.0"
+node = "24.9.0"
+pnpm = "10.25.0"
+
 [tasks."fmt:go"]
 description = "Format Go code"
 run = "go fmt ./..."
@@ -35,18 +40,32 @@ description = "Remove previous release artifacts"
 run = "rm -rf ./dist && mkdir -p ./dist"
 
 [tasks."release:go"]
-description = "Build the distributable TinyCDN binary"
-depends = ["clean:dist"]
-run = "mkdir -p ./dist && CGO_ENABLED=0 go build -o ./dist/tinycdn ./cmd/tinycdn"
+description = "Build a distributable TinyCDN binary"
+run = "sh -c 'target_os=${RELEASE_GOOS:-$(go env GOOS)}; target_arch=${RELEASE_GOARCH:-$(go env GOARCH)}; output=${RELEASE_BIN_PATH:-./dist/release/${target_os}-${target_arch}/tinycdn}; mkdir -p \"$(dirname \"$output\")\" && CGO_ENABLED=0 GOOS=\"$target_os\" GOARCH=\"$target_arch\" go build -o \"$output\" ./cmd/tinycdn'"
 
 [tasks."release:web"]
 description = "Build and stage distributable frontend assets"
-depends = ["clean:dist"]
-run = "pnpm --dir web build && rm -rf ./dist/web && cp -R ./web/dist ./dist/web"
+run = "sh -c 'output=${RELEASE_WEB_DIR:-./dist/release/web}; pnpm --dir web build && rm -rf \"$output\" && mkdir -p \"$output\" && cp -R ./web/dist/. \"$output\"'"
 
 [tasks.release]
 description = "Create distributable release artifacts in ./dist"
-depends = ["release:go", "release:web"]
+run = "sh -c 'mise run clean:dist && mise run release:web && mise run release:go'"
+
+[tasks."release:go:linux-amd64"]
+description = "Build the linux/amd64 TinyCDN binary"
+run = "RELEASE_GOOS=linux RELEASE_GOARCH=amd64 RELEASE_BIN_PATH=./dist/release/linux-amd64/tinycdn mise run release:go"
+
+[tasks."release:go:linux-arm64"]
+description = "Build the linux/arm64 TinyCDN binary"
+run = "RELEASE_GOOS=linux RELEASE_GOARCH=arm64 RELEASE_BIN_PATH=./dist/release/linux-arm64/tinycdn mise run release:go"
+
+[tasks."release:docker:amd64"]
+description = "Build the linux/amd64 Docker image from prebuilt release artifacts"
+run = "sh -c '[ -d ./dist/release/web ] || RELEASE_WEB_DIR=./dist/release/web mise run release:web; [ -f ./dist/release/linux-amd64/tinycdn ] || mise run release:go:linux-amd64; docker build --platform linux/amd64 --build-arg BINARY_PATH=dist/release/linux-amd64/tinycdn --build-arg WEB_PATH=dist/release/web -t tinycdn:linux-amd64 .'"
+
+[tasks."release:docker:arm64"]
+description = "Build the linux/arm64 Docker image from prebuilt release artifacts"
+run = "sh -c '[ -d ./dist/release/web ] || RELEASE_WEB_DIR=./dist/release/web mise run release:web; [ -f ./dist/release/linux-arm64/tinycdn ] || mise run release:go:linux-arm64; docker build --platform linux/arm64 --build-arg BINARY_PATH=dist/release/linux-arm64/tinycdn --build-arg WEB_PATH=dist/release/web -t tinycdn:linux-arm64 .'"
 
 [tasks.check]
 description = "Run the core verification suite"
