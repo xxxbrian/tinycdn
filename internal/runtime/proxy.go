@@ -18,6 +18,14 @@ const (
 	HeaderCDNCacheControl          = "CDN-Cache-Control"
 )
 
+var conditionalRequestHeaders = []string{
+	"If-Match",
+	"If-Modified-Since",
+	"If-None-Match",
+	"If-Range",
+	"If-Unmodified-Since",
+}
+
 func buildReverseProxy(site *CompiledSite) *httputil.ReverseProxy {
 	proxy := httputil.NewSingleHostReverseProxy(site.Upstream)
 	originalDirector := proxy.Director
@@ -61,9 +69,14 @@ func ApplyRuleRequestHeaders(req *http.Request, rule *CompiledRule) {
 		return
 	}
 
-	if rule.Source.Action.Cache.Mode == model.CacheModeBypass {
+	switch rule.Source.Action.Cache.Mode {
+	case model.CacheModeBypass:
 		req.Header.Set("Cache-Control", "no-store")
 		req.Header.Set("Pragma", "no-cache")
+	case model.CacheModeForceCache, model.CacheModeOverrideOrigin:
+		for _, headerName := range conditionalRequestHeaders {
+			req.Header.Del(headerName)
+		}
 	}
 }
 

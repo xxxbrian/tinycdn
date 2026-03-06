@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"testing"
+	"time"
 
 	"tinycdn/internal/model"
 )
@@ -193,4 +194,72 @@ func TestReverseProxyUpstreamHostModes(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestApplyRuleRequestHeaders(t *testing.T) {
+	t.Run("bypass marks request as no-store", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "https://cdn.example.com/assets/app.js", nil)
+		rule := &CompiledRule{
+			Source: model.Rule{
+				Action: model.RuleAction{
+					Cache: model.CacheAction{Mode: model.CacheModeBypass},
+				},
+			},
+		}
+
+		ApplyRuleRequestHeaders(req, rule)
+
+		if got := req.Header.Get("Cache-Control"); got != "no-store" {
+			t.Fatalf("expected Cache-Control no-store, got %q", got)
+		}
+		if got := req.Header.Get("Pragma"); got != "no-cache" {
+			t.Fatalf("expected Pragma no-cache, got %q", got)
+		}
+	})
+
+	t.Run("force cache strips conditional request headers", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "https://cdn.example.com/assets/app.js", nil)
+		req.Header.Set("If-None-Match", "\"abc123\"")
+		req.Header.Set("If-Modified-Since", time.Now().UTC().Format(http.TimeFormat))
+		req.Header.Set("If-Match", "\"xyz789\"")
+		req.Header.Set("Cache-Control", "no-cache")
+
+		rule := &CompiledRule{
+			Source: model.Rule{
+				Action: model.RuleAction{
+					Cache: model.CacheAction{Mode: model.CacheModeForceCache},
+				},
+			},
+		}
+
+		ApplyRuleRequestHeaders(req, rule)
+
+		for _, headerName := range conditionalRequestHeaders {
+			if got := req.Header.Get(headerName); got != "" {
+				t.Fatalf("expected %s to be stripped, got %q", headerName, got)
+			}
+		}
+		if got := req.Header.Get("Cache-Control"); got != "no-cache" {
+			t.Fatalf("expected Cache-Control to remain untouched, got %q", got)
+		}
+	})
+
+	t.Run("follow origin preserves conditional request headers", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "https://cdn.example.com/assets/app.js", nil)
+		req.Header.Set("If-None-Match", "\"abc123\"")
+
+		rule := &CompiledRule{
+			Source: model.Rule{
+				Action: model.RuleAction{
+					Cache: model.CacheAction{Mode: model.CacheModeFollowOrigin},
+				},
+			},
+		}
+
+		ApplyRuleRequestHeaders(req, rule)
+
+		if got := req.Header.Get("If-None-Match"); got != "\"abc123\"" {
+			t.Fatalf("expected follow-origin to preserve conditional request header, got %q", got)
+		}
+	})
 }
