@@ -1,7 +1,9 @@
 package runtime
 
 import (
+	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"testing"
 
 	"tinycdn/internal/model"
@@ -133,4 +135,62 @@ func TestMatchesRuleClauses(t *testing.T) {
 			t.Fatalf("expected not_contains clause to reject request")
 		}
 	})
+}
+
+func TestReverseProxyUpstreamHostModes(t *testing.T) {
+	upstream, err := url.Parse("https://origin.example.com")
+	if err != nil {
+		t.Fatalf("parse upstream: %v", err)
+	}
+
+	tests := []struct {
+		name         string
+		mode         model.UpstreamHostMode
+		explicitHost string
+		wantHost     string
+	}{
+		{
+			name:     "follow origin",
+			mode:     model.UpstreamHostModeFollowOrigin,
+			wantHost: "origin.example.com",
+		},
+		{
+			name:     "follow request",
+			mode:     model.UpstreamHostModeFollowRequest,
+			wantHost: "cdn.example.com",
+		},
+		{
+			name:         "custom",
+			mode:         model.UpstreamHostModeCustom,
+			explicitHost: "a.com",
+			wantHost:     "a.com",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			site := &CompiledSite{
+				Source:       model.Site{},
+				Upstream:     upstream,
+				UpstreamMode: tt.mode,
+				UpstreamHost: upstream.Host,
+			}
+			if tt.explicitHost != "" {
+				site.UpstreamHost = tt.explicitHost
+			}
+
+			proxy := buildReverseProxy(site)
+			req := httptest.NewRequest(http.MethodGet, "https://cdn.example.com/assets/app.js", nil)
+			req.Host = "cdn.example.com"
+
+			proxy.Director(req)
+
+			if req.Host != tt.wantHost {
+				t.Fatalf("expected request host %q, got %q", tt.wantHost, req.Host)
+			}
+			if tt.mode != model.UpstreamHostModeFollowRequest && req.Header.Get("Host") != tt.wantHost {
+				t.Fatalf("expected Host header %q, got %q", tt.wantHost, req.Header.Get("Host"))
+			}
+		})
+	}
 }

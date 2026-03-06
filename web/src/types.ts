@@ -1,4 +1,5 @@
 export type CacheMode = "follow_origin" | "bypass" | "force_cache" | "override_origin";
+export type UpstreamHostMode = "follow_origin" | "follow_request" | "custom";
 
 export type MatchLogical = "and" | "or";
 
@@ -56,6 +57,8 @@ export interface Site {
   hosts: string[];
   upstream: {
     url: string;
+    host_mode?: UpstreamHostMode;
+    host?: string;
   };
   rules: Rule[];
 }
@@ -67,6 +70,8 @@ export interface SiteInput {
   optimistic_refresh: boolean;
   hosts: string[];
   upstream_url: string;
+  upstream_host_mode: UpstreamHostMode;
+  upstream_host: string;
 }
 
 export interface ReorderPayload {

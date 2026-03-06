@@ -27,10 +27,12 @@ type Snapshot struct {
 }
 
 type CompiledSite struct {
-	Source   model.Site
-	Upstream *url.URL
-	Proxy    *httputil.ReverseProxy
-	Rules    []CompiledRule
+	Source       model.Site
+	Upstream     *url.URL
+	UpstreamHost string
+	UpstreamMode model.UpstreamHostMode
+	Proxy        *httputil.ReverseProxy
+	Rules        []CompiledRule
 }
 
 type CompiledRule struct {
@@ -88,9 +90,19 @@ func compileSite(site model.Site) (*CompiledSite, error) {
 	}
 
 	compiled := &CompiledSite{
-		Source:   site,
-		Upstream: upstream,
-		Rules:    make([]CompiledRule, 0, len(site.Rules)),
+		Source:       site,
+		Upstream:     upstream,
+		UpstreamMode: site.Upstream.HostMode,
+		Rules:        make([]CompiledRule, 0, len(site.Rules)),
+	}
+	if compiled.UpstreamMode == "" {
+		compiled.UpstreamMode = model.UpstreamHostModeFollowOrigin
+	}
+	switch compiled.UpstreamMode {
+	case model.UpstreamHostModeCustom:
+		compiled.UpstreamHost = site.Upstream.Host
+	default:
+		compiled.UpstreamHost = upstream.Host
 	}
 
 	for _, rule := range site.Rules {

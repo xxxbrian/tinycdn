@@ -19,6 +19,21 @@ const (
 
 func buildReverseProxy(site *CompiledSite) *httputil.ReverseProxy {
 	proxy := httputil.NewSingleHostReverseProxy(site.Upstream)
+	originalDirector := proxy.Director
+	proxy.Director = func(req *http.Request) {
+		originalDirector(req)
+
+		switch site.UpstreamMode {
+		case model.UpstreamHostModeFollowRequest:
+			return
+		case model.UpstreamHostModeCustom:
+			req.Host = site.UpstreamHost
+			req.Header.Set("Host", site.UpstreamHost)
+		default:
+			req.Host = site.Upstream.Host
+			req.Header.Set("Host", site.Upstream.Host)
+		}
+	}
 
 	proxy.ModifyResponse = func(resp *http.Response) error {
 		requestContext, ok := RequestContextFrom(resp.Request.Context())

@@ -35,12 +35,21 @@ function SiteOriginPage() {
           </CardHeader>
           <CardContent>
             <OriginForm
-              initialValue={site.upstream.url}
+              initialUrl={site.upstream.url}
+              initialHostMode={site.upstream.host_mode ?? "follow_origin"}
+              initialHost={site.upstream.host ?? ""}
               saving={saving}
               onSubmit={async (value) => {
                 setSaving(true);
                 try {
-                  await api.updateSite(site.id, toSiteInput(site, { upstream_url: value }));
+                  await api.updateSite(
+                    site.id,
+                    toSiteInput(site, {
+                      upstream_url: value.url,
+                      upstream_host_mode: value.hostMode,
+                      upstream_host: value.host,
+                    }),
+                  );
                   toast.success("Origin updated");
                   await router.invalidate();
                 } catch (error) {
@@ -70,6 +79,16 @@ function SiteOriginPage() {
               <code className="mt-1 block max-w-full overflow-hidden text-ellipsis whitespace-nowrap">
                 {site.upstream.url}
               </code>
+            </div>
+            <div className="rounded-lg border p-3">
+              <div className="font-medium">Request host mode</div>
+              <div className="mt-1 text-muted-foreground">
+                {site.upstream.host_mode === "follow_request"
+                  ? "Follow incoming request host"
+                  : site.upstream.host_mode === "custom"
+                    ? `Custom: ${site.upstream.host}`
+                    : "Follow origin URL host"}
+              </div>
             </div>
           </CardContent>
         </Card>

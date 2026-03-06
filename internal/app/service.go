@@ -109,7 +109,9 @@ func NewSite(input SiteInput) model.Site {
 		},
 		Hosts: append([]string(nil), input.Hosts...),
 		Upstream: model.Upstream{
-			URL: input.UpstreamURL,
+			URL:      input.UpstreamURL,
+			HostMode: model.UpstreamHostMode(input.UpstreamHostMode),
+			Host:     input.UpstreamHost,
 		},
 		Rules: []model.Rule{
 			model.NewDefaultRule(),
@@ -126,6 +128,8 @@ type SiteInput struct {
 	OptimisticRefresh bool     `json:"optimistic_refresh"`
 	Hosts             []string `json:"hosts"`
 	UpstreamURL       string   `json:"upstream_url"`
+	UpstreamHostMode  string   `json:"upstream_host_mode"`
+	UpstreamHost      string   `json:"upstream_host"`
 }
 
 func (s *Service) CreateSite(input SiteInput) (model.Site, error) {
@@ -152,6 +156,8 @@ func (s *Service) UpdateSite(id string, input SiteInput) (model.Site, error) {
 		cfg.Sites[index].Cache.OptimisticRefresh = input.OptimisticRefresh
 		cfg.Sites[index].Hosts = append([]string(nil), input.Hosts...)
 		cfg.Sites[index].Upstream.URL = input.UpstreamURL
+		cfg.Sites[index].Upstream.HostMode = model.UpstreamHostMode(input.UpstreamHostMode)
+		cfg.Sites[index].Upstream.Host = input.UpstreamHost
 		return nil
 	})
 	if err != nil {

@@ -14,12 +14,33 @@ export const Route = createFileRoute("/sites/$siteId")({
   component: SiteOverviewPage,
 });
 
+function describeOriginHost(site: ReturnType<typeof Route.useLoaderData>) {
+  switch (site.upstream.host_mode) {
+    case "follow_request":
+      return {
+        label: "Follow incoming request host",
+        detail: "The edge forwards the client-facing host to the origin.",
+      };
+    case "custom":
+      return {
+        label: site.upstream.host || "Custom host",
+        detail: "TinyCDN rewrites the upstream Host header to this explicit value.",
+      };
+    default:
+      return {
+        label: "Follow origin URL host",
+        detail: "The edge reuses the hostname from the configured upstream URL.",
+      };
+  }
+}
+
 function SiteOverviewPage() {
   const site = Route.useLoaderData();
   const pathname = useRouterState({
     select: (state) => state.location.pathname,
   });
   const stats = getSiteStats(site);
+  const originHost = describeOriginHost(site);
   const isOverviewRoute = pathname === `/sites/${site.id}`;
 
   if (!isOverviewRoute) {
@@ -85,15 +106,47 @@ function SiteOverviewPage() {
           <CardHeader>
             <CardTitle>Host bindings</CardTitle>
             <CardDescription>
-              Every host listed here maps into this site before rule evaluation begins.
+              Review both the public hostnames bound to this site and the host TinyCDN presents when
+              it talks to the origin.
             </CardDescription>
           </CardHeader>
-          <CardContent className="flex flex-wrap gap-2">
-            {site.hosts.map((host) => (
-              <Badge key={host} variant="secondary">
-                {host}
-              </Badge>
-            ))}
+          <CardContent className="grid gap-4">
+            <div className="rounded-lg border p-4">
+              <div className="flex items-center justify-between gap-4">
+                <div>
+                  <div className="font-medium">Incoming host bindings</div>
+                  <p className="mt-1 text-sm text-muted-foreground">
+                    Requests matching any of these hosts enter this site before rules run.
+                  </p>
+                </div>
+                <Badge variant="outline">{site.hosts.length}</Badge>
+              </div>
+              <div className="mt-4 flex flex-wrap gap-2">
+                {site.hosts.map((host) => (
+                  <Badge key={host} variant="secondary">
+                    {host}
+                  </Badge>
+                ))}
+              </div>
+            </div>
+            <div className="rounded-lg border p-4">
+              <div className="flex items-center justify-between gap-4">
+                <div>
+                  <div className="font-medium">Origin request host</div>
+                  <p className="mt-1 text-sm text-muted-foreground">{originHost.detail}</p>
+                </div>
+                <Badge variant={site.upstream.host_mode === "custom" ? "outline" : "secondary"}>
+                  {site.upstream.host_mode === "custom"
+                    ? "Custom"
+                    : site.upstream.host_mode === "follow_request"
+                      ? "Request"
+                      : "Origin"}
+                </Badge>
+              </div>
+              <code className="mt-4 block max-w-full overflow-hidden text-ellipsis whitespace-nowrap rounded-md bg-muted px-3 py-2 text-sm">
+                {originHost.label}
+              </code>
+            </div>
           </CardContent>
         </Card>
 

@@ -29,8 +29,12 @@ type SiteCache struct {
 }
 
 type Upstream struct {
-	URL string `json:"url" yaml:"url"`
+	URL      string           `json:"url" yaml:"url"`
+	HostMode UpstreamHostMode `json:"host_mode,omitempty" yaml:"host_mode,omitempty"`
+	Host     string           `json:"host,omitempty" yaml:"host,omitempty"`
 }
+
+type UpstreamHostMode string
 
 type Rule struct {
 	ID      string     `json:"id" yaml:"id"`
@@ -78,6 +82,18 @@ var validCacheModes = []CacheMode{
 	CacheModeBypass,
 	CacheModeForceCache,
 	CacheModeOverrideOrigin,
+}
+
+const (
+	UpstreamHostModeFollowOrigin  UpstreamHostMode = "follow_origin"
+	UpstreamHostModeFollowRequest UpstreamHostMode = "follow_request"
+	UpstreamHostModeCustom        UpstreamHostMode = "custom"
+)
+
+var validUpstreamHostModes = []UpstreamHostMode{
+	UpstreamHostModeFollowOrigin,
+	UpstreamHostModeFollowRequest,
+	UpstreamHostModeCustom,
 }
 
 const (
@@ -209,6 +225,28 @@ func validateSite(site Site) error {
 		return fmt.Errorf("upstream url must include host, got %q", site.Upstream.URL)
 	}
 
+	hostMode := site.Upstream.HostMode
+	if hostMode == "" {
+		hostMode = UpstreamHostModeFollowOrigin
+	}
+	if !slices.Contains(validUpstreamHostModes, hostMode) {
+		return fmt.Errorf("unsupported upstream host mode %q", site.Upstream.HostMode)
+	}
+	normalizedHost, err := NormalizeUpstreamRequestHost(site.Upstream.Host)
+	if err != nil {
+		return fmt.Errorf("invalid upstream host %q: %w", site.Upstream.Host, err)
+	}
+	switch hostMode {
+	case UpstreamHostModeCustom:
+		if normalizedHost == "" {
+			return errors.New("custom upstream host mode requires host")
+		}
+	default:
+		if normalizedHost != "" {
+			return errors.New("upstream host is only supported when host mode is custom")
+		}
+	}
+
 	if len(site.Rules) == 0 {
 		return errors.New("site must contain at least one rule")
 	}
@@ -225,6 +263,37 @@ func validateSite(site Site) error {
 	}
 
 	return nil
+}
+
+func NormalizeUpstreamRequestHost(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", nil
+	}
+
+	parseCandidate := value
+	if !strings.Contains(parseCandidate, "://") {
+		parseCandidate = "//" + parseCandidate
+	}
+
+	parsed, err := url.Parse(parseCandidate)
+	if err != nil {
+		return "", err
+	}
+	if parsed.Host == "" {
+		return "", errors.New("host is required")
+	}
+	if parsed.Path != "" && parsed.Path != "/" {
+		return "", errors.New("host must not include a path")
+	}
+	if parsed.RawQuery != "" || parsed.Fragment != "" {
+		return "", errors.New("host must not include query or fragment")
+	}
+	if parsed.User != nil {
+		return "", errors.New("host must not include user info")
+	}
+
+	return strings.ToLower(parsed.Host), nil
 }
 
 func validateRule(rule Rule, isLast bool) error {

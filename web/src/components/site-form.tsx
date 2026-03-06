@@ -4,6 +4,13 @@ import type { SiteInput } from "@/types";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
 
@@ -33,6 +40,7 @@ export function SiteForm({
           ...form,
           name: form.name.trim(),
           upstream_url: form.upstream_url.trim(),
+          upstream_host: form.upstream_host.trim(),
           hosts: form.hosts.flatMap((value) =>
             value
               .split(/[\n,]/)
@@ -80,6 +88,46 @@ export function SiteForm({
           placeholder="https://origin.internal"
         />
       </div>
+
+      <div className="grid gap-2">
+        <Label htmlFor="site-upstream-host-mode">Origin request host</Label>
+        <Select
+          value={form.upstream_host_mode}
+          onValueChange={(value) =>
+            setForm((current) => ({
+              ...current,
+              upstream_host_mode: value as SiteInput["upstream_host_mode"],
+              upstream_host: value === "custom" ? current.upstream_host : "",
+            }))
+          }
+        >
+          <SelectTrigger id="site-upstream-host-mode" className="w-full">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="follow_origin">Follow origin URL host</SelectItem>
+            <SelectItem value="follow_request">Follow incoming request host</SelectItem>
+            <SelectItem value="custom">Custom host</SelectItem>
+          </SelectContent>
+        </Select>
+      </div>
+
+      {form.upstream_host_mode === "custom" ? (
+        <div className="grid gap-2">
+          <Label htmlFor="site-upstream-host">Custom origin host</Label>
+          <Input
+            id="site-upstream-host"
+            value={form.upstream_host}
+            onChange={(event) =>
+              setForm((current) => ({
+                ...current,
+                upstream_host: event.target.value,
+              }))
+            }
+            placeholder="a.com"
+          />
+        </div>
+      ) : null}
 
       <label className="flex items-start justify-between gap-4 rounded-lg border p-3 text-sm">
         <div>

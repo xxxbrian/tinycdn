@@ -89,6 +89,8 @@ function SitesPage() {
                     optimistic_refresh: false,
                     hosts: [],
                     upstream_url: "",
+                    upstream_host_mode: "follow_origin",
+                    upstream_host: "",
                   }}
                   submitLabel="Create site"
                   saving={saving}
