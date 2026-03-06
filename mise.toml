@@ -1,0 +1,65 @@
+[tasks."fmt:go"]
+description = "Format Go code"
+run = "go fmt ./..."
+
+[tasks."fmt:web"]
+description = "Format frontend code"
+run = "pnpm --dir web run fmt"
+
+[tasks.fmt]
+description = "Format Go and frontend code"
+depends = ["fmt:go", "fmt:web"]
+
+[tasks."test:go"]
+description = "Run Go tests with CGO disabled"
+run = "CGO_ENABLED=0 go test ./..."
+
+[tasks."build:go"]
+description = "Build Go binaries with CGO disabled"
+run = "CGO_ENABLED=0 go build ./..."
+
+[tasks."typecheck:web"]
+description = "Type-check the frontend"
+run = "pnpm --dir web exec tsc --noEmit"
+
+[tasks."build:web"]
+description = "Build the frontend"
+run = "pnpm --dir web build"
+
+[tasks.build]
+description = "Build project artifacts"
+depends = ["build:go", "build:web"]
+
+[tasks."clean:dist"]
+description = "Remove previous release artifacts"
+run = "rm -rf ./dist && mkdir -p ./dist"
+
+[tasks."release:go"]
+description = "Build the distributable TinyCDN binary"
+depends = ["clean:dist"]
+run = "mkdir -p ./dist && CGO_ENABLED=0 go build -o ./dist/tinycdn ./cmd/tinycdn"
+
+[tasks."release:web"]
+description = "Build and stage distributable frontend assets"
+depends = ["clean:dist"]
+run = "pnpm --dir web build && rm -rf ./dist/web && cp -R ./web/dist ./dist/web"
+
+[tasks.release]
+description = "Create distributable release artifacts in ./dist"
+depends = ["release:go", "release:web"]
+
+[tasks.check]
+description = "Run the core verification suite"
+depends = ["test:go", "typecheck:web", "build"]
+
+[tasks."dev:server"]
+description = "Run the TinyCDN admin and proxy server"
+run = "CGO_ENABLED=0 go run ./cmd/tinycdn"
+
+[tasks."dev:web"]
+description = "Run the frontend dev server"
+run = "pnpm --dir web dev --host"
+
+[tasks.dev]
+description = "Run backend and frontend dev servers together"
+run = "sh -c 'trap \"kill 0\" EXIT INT TERM; CGO_ENABLED=0 go run ./cmd/tinycdn & pnpm --dir web dev --host & wait'"
