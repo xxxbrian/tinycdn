@@ -1,0 +1,24 @@
+# Docs kept local
+*.md
+
+# OS
+.DS_Store
+*.swp
+*.swo
+
+# Local environment
+.env
+.env.*
+*.local
+
+# Runtime data
+/data/
+
+# Logs / temp files
+*.log
+*.tmp
+
+# Go build / test artifacts
+*.out
+*.test
+coverage.out
