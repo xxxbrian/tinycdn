@@ -69,6 +69,9 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-pnpm-
 
+      - name: Install web dependencies
+        run: pnpm --dir web install --frozen-lockfile
+
       - name: Build release web assets
         run: RELEASE_WEB_DIR=./dist/release/web mise run release:web
 
