@@ -6,7 +6,10 @@ ARG WEB_PATH=dist/release/web
 
 WORKDIR /app
 
-RUN groupadd --system tinycdn \
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --system tinycdn \
     && useradd --system --gid tinycdn --create-home --home-dir /app tinycdn \
     && mkdir -p /app/data/cache/badger /app/web \
     && chown -R tinycdn:tinycdn /app
