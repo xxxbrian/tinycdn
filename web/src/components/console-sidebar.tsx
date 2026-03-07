@@ -1,4 +1,4 @@
-import { Activity, CloudFog, FolderKanban, Gauge, LifeBuoy, Logs, Settings2 } from "lucide-react";
+import { Activity, CloudFog, FolderKanban, Gauge, Logs } from "lucide-react";
 import { Link, useRouterState } from "@tanstack/react-router";
 
 import { NavUser } from "@/components/nav-user";
@@ -20,11 +20,6 @@ const platformItems = [
   { title: "Sites", to: "/sites", icon: FolderKanban },
   { title: "Logs", to: "/logs", icon: Logs },
   { title: "Analytics", to: "/analytics", icon: Activity },
-] as const;
-
-const secondaryItems = [
-  { title: "Platform settings", to: "/analytics", icon: Settings2 },
-  { title: "Support", to: "/logs", icon: LifeBuoy },
 ] as const;
 
 export function ConsoleSidebar() {
@@ -70,23 +65,6 @@ export function ConsoleSidebar() {
                   </SidebarMenuItem>
                 );
               })}
-            </SidebarMenu>
-          </SidebarGroupContent>
-        </SidebarGroup>
-
-        <SidebarGroup className="mt-auto">
-          <SidebarGroupContent>
-            <SidebarMenu>
-              {secondaryItems.map((item) => (
-                <SidebarMenuItem key={item.title}>
-                  <SidebarMenuButton asChild size="sm" tooltip={item.title}>
-                    <Link to={item.to}>
-                      <item.icon />
-                      <span>{item.title}</span>
-                    </Link>
-                  </SidebarMenuButton>
-                </SidebarMenuItem>
-              ))}
             </SidebarMenu>
           </SidebarGroupContent>
         </SidebarGroup>

@@ -1,5 +1,5 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { startTransition, useEffect, useState } from "react";
+import { startTransition, useDeferredValue, useEffect, useState } from "react";
 
 import type { AnalyticsPeriod, AuditLogPage, RequestLogPage } from "@/types";
 import { api } from "@/lib/api";
@@ -33,6 +33,7 @@ function SiteLogsPage() {
   const initial = Route.useLoaderData();
   const [period, setPeriod] = useState<AnalyticsPeriod>("24h");
   const [search, setSearch] = useState("");
+  const deferredSearch = useDeferredValue(search);
   const [method, setMethod] = useState("all");
   const [cacheState, setCacheState] = useState("all");
   const [statusClass, setStatusClass] = useState("all");
@@ -46,7 +47,7 @@ function SiteLogsPage() {
         period,
         siteId: initial.site.id,
         limit: 20,
-        search,
+        search: deferredSearch.trim() || undefined,
         method: method === "all" ? undefined : method,
         cacheState: cacheState === "all" ? undefined : cacheState,
         statusClass: statusClass === "all" ? undefined : statusClass,
@@ -68,7 +69,7 @@ function SiteLogsPage() {
     return () => {
       cancelled = true;
     };
-  }, [cacheState, initial.site.id, method, period, search, statusClass]);
+  }, [cacheState, deferredSearch, initial.site.id, method, period, statusClass]);
 
   return (
     <SiteShell site={initial.site} section="Logs">
@@ -78,8 +79,9 @@ function SiteLogsPage() {
         description="Filter recent requests and review configuration actions that touched this site."
       />
 
-      <div className="grid gap-3 px-4 lg:grid-cols-[1.2fr_0.8fr_0.8fr_0.8fr_0.8fr] lg:px-6">
+      <div className="grid gap-3 px-4 sm:grid-cols-2 xl:grid-cols-[minmax(0,1.35fr)_repeat(4,minmax(0,0.8fr))] lg:px-6">
         <Input
+          className="sm:col-span-2 xl:col-span-1"
           value={search}
           onChange={(event) => setSearch(event.target.value)}
           placeholder="Search request ID, path, host, IP, or user agent"
@@ -135,7 +137,7 @@ function SiteLogsPage() {
         </Select>
       </div>
 
-      <div className="grid gap-6 px-4 pb-6 lg:grid-cols-[1.5fr_0.9fr] lg:px-6">
+      <div className="grid gap-6 px-4 pb-6 2xl:grid-cols-[minmax(0,1.5fr)_20rem] lg:px-6">
         <RequestLogsTable
           title="Site request stream"
           description="Recent requests through this site."

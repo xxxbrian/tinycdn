@@ -1,5 +1,5 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { startTransition, useEffect, useState } from "react";
+import { startTransition, useDeferredValue, useEffect, useState } from "react";
 
 import type { AnalyticsPeriod, AuditLogPage, RequestLogPage } from "@/types";
 import { api } from "@/lib/api";
@@ -32,6 +32,7 @@ function LogsPage() {
   const initial = Route.useLoaderData();
   const [period, setPeriod] = useState<AnalyticsPeriod>("24h");
   const [search, setSearch] = useState("");
+  const deferredSearch = useDeferredValue(search);
   const [method, setMethod] = useState("all");
   const [cacheState, setCacheState] = useState("all");
   const [statusClass, setStatusClass] = useState("all");
@@ -44,7 +45,7 @@ function LogsPage() {
       api.requestLogs({
         period,
         limit: 20,
-        search,
+        search: deferredSearch.trim() || undefined,
         method: method === "all" ? undefined : method,
         cacheState: cacheState === "all" ? undefined : cacheState,
         statusClass: statusClass === "all" ? undefined : statusClass,
@@ -62,7 +63,7 @@ function LogsPage() {
     return () => {
       cancelled = true;
     };
-  }, [cacheState, method, period, search, statusClass]);
+  }, [cacheState, deferredSearch, method, period, statusClass]);
 
   return (
     <ConsoleShell>
@@ -72,8 +73,9 @@ function LogsPage() {
         description="Filter request records and review audit events without leaving the dashboard shell."
       />
 
-      <div className="grid gap-3 px-4 lg:grid-cols-[1.2fr_0.8fr_0.8fr_0.8fr_0.8fr] lg:px-6">
+      <div className="grid gap-3 px-4 sm:grid-cols-2 xl:grid-cols-[minmax(0,1.35fr)_repeat(4,minmax(0,0.8fr))] lg:px-6">
         <Input
+          className="sm:col-span-2 xl:col-span-1"
           value={search}
           onChange={(event) => setSearch(event.target.value)}
           placeholder="Search request ID, host, path, IP, or user agent"
@@ -129,7 +131,7 @@ function LogsPage() {
         </Select>
       </div>
 
-      <div className="grid gap-6 px-4 pb-6 lg:grid-cols-[1.5fr_0.9fr] lg:px-6">
+      <div className="grid gap-6 px-4 pb-6 2xl:grid-cols-[minmax(0,1.5fr)_20rem] lg:px-6">
         <RequestLogsTable
           title="Request stream"
           description="Recent data-plane requests for the current filter set."

@@ -1,6 +1,14 @@
 import type { RequestLogItem } from "@/types";
 
-import { formatBytes, formatDateTime, formatDuration, formatPath } from "@/lib/telemetry";
+import {
+  formatBytes,
+  formatDateTime,
+  formatDuration,
+  formatOriginStatus,
+  formatPath,
+  formatRequestID,
+  summarizeCacheStatus,
+} from "@/lib/telemetry";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import {
@@ -27,8 +35,8 @@ export function RequestLogsTable({
         <CardTitle>{title}</CardTitle>
         <CardDescription>{description}</CardDescription>
       </CardHeader>
-      <CardContent className="p-0">
-        <Table>
+      <CardContent className="overflow-x-auto p-0">
+        <Table className="min-w-[880px]">
           <TableHeader>
             <TableRow>
               <TableHead>When</TableHead>
@@ -60,30 +68,43 @@ export function RequestLogsTable({
                     <div className="mt-1 truncate text-xs text-muted-foreground">
                       {formatPath(item)}
                     </div>
-                    <div className="mt-1 truncate text-[11px] text-muted-foreground">
-                      {item.request_id}
-                    </div>
+                    <code
+                      className="mt-1 block truncate text-[11px] text-muted-foreground"
+                      title={item.request_id}
+                    >
+                      {formatRequestID(item.request_id)}
+                    </code>
                   </TableCell>
                   <TableCell>
                     <div className="font-medium">{item.status_code}</div>
-                    <div className="text-xs text-muted-foreground">
-                      {item.origin_status_code || "no origin"}
-                    </div>
+                    {formatOriginStatus(item) ? (
+                      <div className="text-xs text-muted-foreground">
+                        {formatOriginStatus(item)}
+                      </div>
+                    ) : null}
                   </TableCell>
                   <TableCell>
-                    <Badge variant={item.cache_state === "HIT" ? "outline" : "secondary"}>
+                    <Badge
+                      variant={
+                        item.cache_state === "HIT" || item.cache_state === "STALE"
+                          ? "outline"
+                          : "secondary"
+                      }
+                    >
                       {item.cache_state || "n/a"}
                     </Badge>
                     <div className="mt-1 truncate text-xs text-muted-foreground">
-                      {item.cache_status}
+                      {summarizeCacheStatus(item)}
                     </div>
                   </TableCell>
                   <TableCell>
                     <div className="font-medium">{formatDuration(item.total_duration_ms)}</div>
-                    <div className="text-xs text-muted-foreground">
-                      origin{" "}
-                      {item.origin_duration_ms ? formatDuration(item.origin_duration_ms) : "n/a"}
-                    </div>
+                    {item.origin_requests > 0 ? (
+                      <div className="text-xs text-muted-foreground">
+                        origin{" "}
+                        {item.origin_duration_ms ? formatDuration(item.origin_duration_ms) : "n/a"}
+                      </div>
+                    ) : null}
                   </TableCell>
                   <TableCell className="whitespace-nowrap text-sm">
                     {formatBytes(item.response_bytes)}
