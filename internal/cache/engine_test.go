@@ -397,3 +397,391 @@ func TestEnginePurgeURLClearsAllVariants(t *testing.T) {
 		t.Fatalf("expected 3 deleted records (2 variants + 1 vary spec), got %d", deleted)
 	}
 }
+
+func TestEngineServesStaleOnErrorWithinStaleIfError(t *testing.T) {
+	store := newMemoryStore()
+	engine := NewEngine(store)
+	now := time.Date(2026, time.March, 7, 0, 0, 0, 0, time.UTC)
+	engine.now = func() time.Time { return now }
+
+	policy := Policy{
+		SiteID:          "site-1",
+		RuleID:          "rule-1",
+		PolicyTag:       "rule-1|force",
+		Mode:            model.CacheModeForceCache,
+		TTL:             time.Second,
+		HasTTL:          true,
+		StaleIfError:    time.Minute,
+		HasStaleIfError: true,
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "https://cdn.example.com/assets/app.js", nil)
+	fetches := 0
+	fetch := func(_ context.Context, req *http.Request) (StoredResponse, error) {
+		fetches++
+		if fetches > 1 {
+			return StoredResponse{}, context.DeadlineExceeded
+		}
+		return StoredResponse{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": {"application/javascript"}},
+			Body:       []byte("v1"),
+		}, nil
+	}
+
+	if _, err := engine.Handle(context.Background(), req, policy, fetch); err != nil {
+		t.Fatalf("prime cache: %v", err)
+	}
+
+	now = now.Add(2 * time.Second)
+	result, err := engine.Handle(context.Background(), req, policy, fetch)
+	if err != nil {
+		t.Fatalf("stale-if-error handle: %v", err)
+	}
+	if result.State != StateStale {
+		t.Fatalf("expected stale result on upstream error, got %s", result.State)
+	}
+	if string(result.Body) != "v1" {
+		t.Fatalf("expected stale body v1, got %q", string(result.Body))
+	}
+}
+
+func TestEngineRequestBehaviorMatrix(t *testing.T) {
+	tests := []struct {
+		name      string
+		method    string
+		rangeHdr  string
+		policy    Policy
+		wantState State
+	}{
+		{
+			name:      "post bypasses cache",
+			method:    http.MethodPost,
+			policy:    Policy{Mode: model.CacheModeForceCache},
+			wantState: StateBypass,
+		},
+		{
+			name:      "range request bypasses cache",
+			method:    http.MethodGet,
+			rangeHdr:  "bytes=0-99",
+			policy:    Policy{Mode: model.CacheModeForceCache},
+			wantState: StateBypass,
+		},
+		{
+			name:      "bypass mode bypasses cache",
+			method:    http.MethodGet,
+			policy:    Policy{Mode: model.CacheModeBypass},
+			wantState: StateBypass,
+		},
+		{
+			name:      "head stays cacheable pipeline",
+			method:    http.MethodHead,
+			policy:    Policy{Mode: model.CacheModeForceCache},
+			wantState: StateMiss,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(tt.method, "https://cdn.example.com/assets/app.js", nil)
+			if tt.rangeHdr != "" {
+				req.Header.Set("Range", tt.rangeHdr)
+			}
+
+			prepared, state := prepareRequest(req, tt.policy)
+			if state != tt.wantState {
+				t.Fatalf("expected %s, got %s", tt.wantState, state)
+			}
+			if prepared.Method != req.Method {
+				t.Fatalf("expected method to be preserved, got %s", prepared.Method)
+			}
+		})
+	}
+}
+
+func TestEngineHeadUsesGetCacheKey(t *testing.T) {
+	store := newMemoryStore()
+	engine := NewEngine(store)
+	now := time.Date(2026, time.March, 7, 0, 0, 0, 0, time.UTC)
+	engine.now = func() time.Time { return now }
+
+	policy := Policy{
+		SiteID:    "site-1",
+		RuleID:    "rule-1",
+		PolicyTag: "rule-1|force",
+		Mode:      model.CacheModeForceCache,
+		TTL:       time.Minute,
+		HasTTL:    true,
+	}
+
+	fetches := 0
+	fetch := func(_ context.Context, req *http.Request) (StoredResponse, error) {
+		fetches++
+		return StoredResponse{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": {"text/plain"}},
+			Body:       []byte("payload"),
+		}, nil
+	}
+
+	getReq := httptest.NewRequest(http.MethodGet, "https://cdn.example.com/assets/app.js", nil)
+	if _, err := engine.Handle(context.Background(), getReq, policy, fetch); err != nil {
+		t.Fatalf("prime get cache: %v", err)
+	}
+
+	headReq := httptest.NewRequest(http.MethodHead, "https://cdn.example.com/assets/app.js", nil)
+	result, err := engine.Handle(context.Background(), headReq, policy, fetch)
+	if err != nil {
+		t.Fatalf("head handle: %v", err)
+	}
+	if result.State != StateHit {
+		t.Fatalf("expected HEAD to hit GET cache entry, got %s", result.State)
+	}
+	if fetches != 1 {
+		t.Fatalf("expected one upstream fetch, got %d", fetches)
+	}
+}
+
+func TestEngineFollowOriginRequestAndResponseMatrix(t *testing.T) {
+	tests := []struct {
+		name           string
+		header         http.Header
+		now            time.Time
+		optimistic     bool
+		wantStored     bool
+		wantSecond     State
+		wantFetches    int
+		requestNoCache bool
+	}{
+		{
+			name:        "max-age caches",
+			header:      http.Header{"Cache-Control": {"public, max-age=30"}},
+			wantStored:  true,
+			wantSecond:  StateHit,
+			wantFetches: 1,
+		},
+		{
+			name:        "s-maxage wins",
+			header:      http.Header{"Cache-Control": {"public, max-age=0, s-maxage=30"}},
+			wantStored:  true,
+			wantSecond:  StateHit,
+			wantFetches: 1,
+		},
+		{
+			name:        "expires caches",
+			header:      http.Header{"Expires": {"Fri, 07 Mar 2026 00:00:30 GMT"}},
+			now:         time.Date(2026, time.March, 7, 0, 0, 0, 0, time.UTC),
+			wantStored:  true,
+			wantSecond:  StateHit,
+			wantFetches: 1,
+		},
+		{
+			name:        "no-store does not cache",
+			header:      http.Header{"Cache-Control": {"public, no-store, max-age=30"}},
+			wantStored:  false,
+			wantSecond:  StateMiss,
+			wantFetches: 2,
+		},
+		{
+			name:        "private does not cache",
+			header:      http.Header{"Cache-Control": {"private, max-age=30"}},
+			wantStored:  false,
+			wantSecond:  StateMiss,
+			wantFetches: 2,
+		},
+		{
+			name:        "vary star does not cache",
+			header:      http.Header{"Cache-Control": {"public, max-age=30"}, "Vary": {"*"}},
+			wantStored:  false,
+			wantSecond:  StateMiss,
+			wantFetches: 2,
+		},
+		{
+			name:        "uncacheable status does not cache",
+			header:      http.Header{"Cache-Control": {"public, max-age=30"}},
+			wantStored:  false,
+			wantSecond:  StateMiss,
+			wantFetches: 2,
+		},
+		{
+			name:           "client no-cache forces revalidation in follow-origin",
+			header:         http.Header{"Cache-Control": {"public, max-age=30"}},
+			wantStored:     true,
+			wantSecond:     StateMiss,
+			wantFetches:    2,
+			requestNoCache: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := newMemoryStore()
+			engine := NewEngine(store)
+			now := tt.now
+			if now.IsZero() {
+				now = time.Date(2026, time.March, 7, 0, 0, 0, 0, time.UTC)
+			}
+			engine.now = func() time.Time { return now }
+
+			policy := Policy{
+				SiteID:     "site-1",
+				RuleID:     "rule-1",
+				PolicyTag:  "rule-1|origin",
+				Mode:       model.CacheModeFollowOrigin,
+				Optimistic: tt.optimistic,
+			}
+
+			fetches := 0
+			statusCode := http.StatusOK
+			if tt.name == "uncacheable status does not cache" {
+				statusCode = http.StatusCreated
+			}
+			fetch := func(_ context.Context, req *http.Request) (StoredResponse, error) {
+				fetches++
+				return StoredResponse{
+					StatusCode: statusCode,
+					Header:     tt.header.Clone(),
+					Body:       []byte("body"),
+				}, nil
+			}
+
+			req := httptest.NewRequest(http.MethodGet, "https://cdn.example.com/assets/app.js", nil)
+			first, err := engine.Handle(context.Background(), req, policy, fetch)
+			if err != nil {
+				t.Fatalf("first handle: %v", err)
+			}
+			if tt.wantStored && first.State != StateMiss {
+				t.Fatalf("expected first result to miss/store, got %s", first.State)
+			}
+
+			if tt.requestNoCache {
+				req = httptest.NewRequest(http.MethodGet, "https://cdn.example.com/assets/app.js", nil)
+				req.Header.Set("Cache-Control", "no-cache")
+			}
+
+			second, err := engine.Handle(context.Background(), req, policy, fetch)
+			if err != nil {
+				t.Fatalf("second handle: %v", err)
+			}
+			if second.State != tt.wantSecond {
+				t.Fatalf("expected second state %s, got %s", tt.wantSecond, second.State)
+			}
+			if fetches != tt.wantFetches {
+				t.Fatalf("expected %d fetches, got %d", tt.wantFetches, fetches)
+			}
+		})
+	}
+}
+
+func TestEngineOptimisticUsesOriginStaleWindow(t *testing.T) {
+	store := newMemoryStore()
+	engine := NewEngine(store)
+	now := time.Date(2026, time.March, 7, 0, 0, 0, 0, time.UTC)
+	engine.now = func() time.Time { return now }
+
+	policy := Policy{
+		SiteID:             "site-1",
+		RuleID:             "rule-1",
+		PolicyTag:          "rule-1|origin|optimistic",
+		Mode:               model.CacheModeFollowOrigin,
+		Optimistic:         true,
+		OptimisticMaxStale: time.Minute,
+	}
+
+	fetches := 0
+	fetch := func(_ context.Context, req *http.Request) (StoredResponse, error) {
+		fetches++
+		return StoredResponse{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Cache-Control": {"public, max-age=1, stale-while-revalidate=120"}},
+			Body:       []byte("body"),
+		}, nil
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "https://cdn.example.com/assets/app.js", nil)
+	if _, err := engine.Handle(context.Background(), req, policy, fetch); err != nil {
+		t.Fatalf("prime cache: %v", err)
+	}
+
+	now = now.Add(90 * time.Second)
+	result, err := engine.Handle(context.Background(), req, policy, fetch)
+	if err != nil {
+		t.Fatalf("stale optimistic hit: %v", err)
+	}
+	if result.State != StateStale {
+		t.Fatalf("expected stale result inside origin stale-while-revalidate window, got %s", result.State)
+	}
+}
+
+func TestEnginePurgeSiteClearsResponsesAndVarySpecs(t *testing.T) {
+	store := newMemoryStore()
+	engine := NewEngine(store)
+	now := time.Date(2026, time.March, 7, 0, 0, 0, 0, time.UTC)
+	engine.now = func() time.Time { return now }
+
+	policy := Policy{
+		SiteID:    "site-1",
+		RuleID:    "rule-1",
+		PolicyTag: "rule-1|origin",
+		Mode:      model.CacheModeFollowOrigin,
+	}
+
+	fetch := func(_ context.Context, req *http.Request) (StoredResponse, error) {
+		header := http.Header{"Cache-Control": {"public, max-age=60"}}
+		if strings.Contains(req.URL.Path, "vary") {
+			header.Set("Vary", "Accept-Encoding")
+		}
+		return StoredResponse{
+			StatusCode: http.StatusOK,
+			Header:     header,
+			Body:       []byte(req.URL.Path),
+		}, nil
+	}
+
+	req1 := httptest.NewRequest(http.MethodGet, "https://cdn.example.com/static/a.js", nil)
+	req2 := httptest.NewRequest(http.MethodGet, "https://cdn.example.com/static/vary.js", nil)
+	req2.Header.Set("Accept-Encoding", "gzip")
+	if _, err := engine.Handle(context.Background(), req1, policy, fetch); err != nil {
+		t.Fatalf("prime static entry: %v", err)
+	}
+	if _, err := engine.Handle(context.Background(), req2, policy, fetch); err != nil {
+		t.Fatalf("prime vary entry: %v", err)
+	}
+
+	deleted, err := engine.PurgeSite(context.Background(), "site-1")
+	if err != nil {
+		t.Fatalf("purge site: %v", err)
+	}
+	if deleted < 3 {
+		t.Fatalf("expected at least 3 deleted records, got %d", deleted)
+	}
+
+	if _, found, _ := store.GetEntry(context.Background(), responseKey(buildBaseCacheKey("site-1", http.MethodGet, "/static/a.js", ""))); found {
+		t.Fatalf("expected static entry to be purged")
+	}
+	if _, found, _ := store.GetVary(context.Background(), varyKey(buildBaseCacheKey("site-1", http.MethodGet, "/static/vary.js", ""))); found {
+		t.Fatalf("expected vary spec to be purged")
+	}
+}
+
+func TestBadgerCacheHelpers(t *testing.T) {
+	directives := parseCacheControl(`public, max-age="30", s-maxage=60, stale-if-error=120, stale-while-revalidate=30`)
+	if directives.sMaxAge == nil || directives.maxAge == nil {
+		t.Fatalf("expected max-age and s-maxage to parse")
+	}
+	if *directives.sMaxAge != 60*time.Second || *directives.maxAge != 30*time.Second {
+		t.Fatalf("unexpected parsed durations: %#v", directives)
+	}
+	if directives.staleIfError != 120*time.Second || directives.staleWhileRevalidate != 30*time.Second {
+		t.Fatalf("unexpected stale directives: %#v", directives)
+	}
+
+	headers, cacheable := parseVary([]string{"Accept-Encoding, accept-language", "Origin"})
+	if !cacheable {
+		t.Fatalf("expected vary to be cacheable")
+	}
+	expected := []string{"Accept-Encoding", "Accept-Language", "Origin"}
+	if strings.Join(headers, ",") != strings.Join(expected, ",") {
+		t.Fatalf("unexpected vary headers: %#v", headers)
+	}
+}
