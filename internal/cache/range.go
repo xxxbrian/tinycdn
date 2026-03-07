@@ -319,7 +319,7 @@ func (c *RangeCache) fillRange(ctx context.Context, baseKey string, req *http.Re
 			}
 		}
 
-		fetched, nextObject, nextObjectKey, fullObject, err := c.fetchAndMaybeStoreChunk(ctx, req, baseKey, policy, chunkIndex, fetch)
+		fetched, nextObject, nextObjectKey, fullObject, err := c.fetchAndMaybeStoreChunk(ctx, req, baseKey, objectKey, policy, chunkIndex, fetch)
 		if err != nil {
 			return RangeResult{}, err
 		}
@@ -377,18 +377,17 @@ func (c *RangeCache) fillRange(ctx context.Context, baseKey string, req *http.Re
 	return buildChunkRangeResult(object, ordered, resolved, StateMiss, missCacheStatus(objectKey, false, combineStatusDetails(lookupErr, "RANGE"))), nil
 }
 
-func (c *RangeCache) fetchAndMaybeStoreChunk(ctx context.Context, req *http.Request, baseKey string, policy Policy, chunkIndex int64, fetch FetchFunc) (struct {
+func (c *RangeCache) fetchAndMaybeStoreChunk(ctx context.Context, req *http.Request, baseKey string, flightObjectKey string, policy Policy, chunkIndex int64, fetch FetchFunc) (struct {
 	entry ChunkEntry
 	part  RangePart
 	resp  StoredResponse
 }, ChunkObject, string, bool, error) {
-	fillKey := rangeChunkKey(responseKey(baseKey), chunkIndex)
+	fillKey := rangeChunkKey(flightObjectKey, chunkIndex)
 	value, err, _ := c.fill.Do(fillKey, func() (any, error) {
 		response, object, objectKey, decision, fullObject, err := c.fetchChunk(ctx, req, policy, chunkIndex, fetch)
 		if err != nil {
 			return nil, err
 		}
-
 		chunk := ChunkEntry{
 			Key:       rangeChunkKey(objectKey, chunkIndex),
 			SiteID:    policy.SiteID,
@@ -499,7 +498,9 @@ func (c *RangeCache) fetchChunk(ctx context.Context, req *http.Request, policy P
 		return StoredResponse{}, ChunkObject{}, "", storeDecision{}, false, err
 	}
 	if response.StatusCode == http.StatusOK && response.Header.Get("Content-Range") == "" && response.ContentLength > 0 {
-		object := buildChunkObject(c.now(), responseKey(buildBaseCacheKey(policy.SiteID, http.MethodGet, req.URL.Path, req.URL.RawQuery)), policy, storeDecision{}, response, response.ContentLength, response.ContentLength)
+		varyHeaders := effectiveVaryHeaders(req.Header, response.Header, nil)
+		objectKey := buildStorageKey(buildBaseCacheKey(policy.SiteID, http.MethodGet, req.URL.Path, req.URL.RawQuery), varyHeaders, req.Header)
+		object := buildChunkObject(c.now(), objectKey, policy, storeDecision{}, response, response.ContentLength, response.ContentLength)
 		return response, object, object.Key, storeDecision{}, true, nil
 	}
 	if response.StatusCode != http.StatusPartialContent || response.Header.Get("Content-Range") == "" {

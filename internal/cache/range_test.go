@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -217,5 +218,151 @@ func TestRangeCacheManagedOriginSeparatesChunkVariants(t *testing.T) {
 	}
 	if fetches != 2 {
 		t.Fatalf("expected two origin-specific chunk fills, got %d", fetches)
+	}
+}
+
+func TestRangeCacheRevalidatesChunkObjectAndReusesChunksOn304(t *testing.T) {
+	store := newMemoryStore()
+	cache := NewRangeCache(store)
+	now := time.Date(2026, time.March, 7, 0, 0, 0, 0, time.UTC)
+	cache.now = func() time.Time { return now }
+
+	policy := Policy{
+		SiteID:    "site-1",
+		RuleID:    "rule-1",
+		PolicyTag: "rule-1|follow",
+		Mode:      model.CacheModeFollowOrigin,
+	}
+
+	fetches := 0
+	fetch := func(_ context.Context, req *http.Request) (StoredResponse, error) {
+		fetches++
+		if req.Method == http.MethodHead {
+			header := http.Header{}
+			header.Set("Cache-Control", "public, no-cache")
+			header.Set("ETag", `"v1"`)
+			return StoredResponse{
+				StatusCode: http.StatusNotModified,
+				Header:     header,
+			}, nil
+		}
+		header := http.Header{}
+		header.Set("Cache-Control", "public, no-cache")
+		header.Set("Content-Range", "bytes 0-25/26")
+		header.Set("Content-Type", "text/plain")
+		header.Set("ETag", `"v1"`)
+		return StoredResponse{
+			StatusCode:    http.StatusPartialContent,
+			Header:        header,
+			Body:          []byte("abcdefghijklmnopqrstuvwxyz"),
+			ContentLength: 26,
+		}, nil
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "https://cdn.example.com/video.mp4", nil)
+	req.Header.Set("Range", "bytes=5-9")
+	first, err := cache.Handle(context.Background(), req, policy, fetch)
+	if err != nil {
+		t.Fatalf("first range miss: %v", err)
+	}
+	if first.State != StateMiss {
+		t.Fatalf("expected first miss, got %s", first.State)
+	}
+	baseKey := buildBaseCacheKey("site-1", http.MethodGet, "/video.mp4", "")
+	object, found, err := store.GetChunkObject(context.Background(), rangeObjectKey(responseKey(baseKey)))
+	if err != nil || !found {
+		t.Fatalf("expected stored chunk object after first miss, found=%t err=%v keys=%#v", found, err, store.chunkObjects)
+	}
+	chunk, found, err := store.GetChunk(context.Background(), rangeChunkKey(responseKey(baseKey), 0))
+	if err != nil || !found {
+		t.Fatalf("expected stored chunk after first miss, found=%t err=%v", found, err)
+	}
+	if !chunk.InvalidAt.After(now) || !object.InvalidAt.After(now) {
+		t.Fatalf("expected stored chunk/object invalid_at in future, chunk=%s object=%s", chunk.InvalidAt, object.InvalidAt)
+	}
+
+	now = now.Add(time.Minute)
+	second, err := cache.Handle(context.Background(), req, policy, fetch)
+	if err != nil {
+		t.Fatalf("second range request: %v", err)
+	}
+	if second.State != StateHit {
+		t.Fatalf("expected second range request hit after revalidation, got %s", second.State)
+	}
+	if fetches != 2 {
+		t.Fatalf("expected one chunk fill + one HEAD revalidation, got %d", fetches)
+	}
+}
+
+func TestRangeCacheSingleflightSeparatesOrigins(t *testing.T) {
+	store := newMemoryStore()
+	cache := NewRangeCache(store)
+	now := time.Date(2026, time.March, 7, 0, 0, 0, 0, time.UTC)
+	cache.now = func() time.Time { return now }
+
+	policy := Policy{
+		SiteID:    "site-1",
+		RuleID:    "rule-1",
+		PolicyTag: "rule-1|force",
+		Mode:      model.CacheModeForceCache,
+		TTL:       time.Minute,
+		HasTTL:    true,
+	}
+
+	var mu sync.Mutex
+	counts := map[string]int{}
+	block := make(chan struct{})
+	fetch := func(_ context.Context, req *http.Request) (StoredResponse, error) {
+		origin := req.Header.Get("Origin")
+		mu.Lock()
+		counts[origin]++
+		mu.Unlock()
+		<-block
+		return StoredResponse{
+			StatusCode: http.StatusPartialContent,
+			Header: http.Header{
+				"Content-Range":               {"bytes 0-25/26"},
+				"Content-Type":                {"text/plain"},
+				"Access-Control-Allow-Origin": {origin},
+			},
+			Body:          []byte("abcdefghijklmnopqrstuvwxyz"),
+			ContentLength: 26,
+		}, nil
+	}
+
+	reqA := httptest.NewRequest(http.MethodGet, "https://cdn.example.com/video.mp4", nil)
+	reqA.Header.Set("Range", "bytes=5-9")
+	reqA.Header.Set("Origin", "https://a.example.com")
+	reqB := httptest.NewRequest(http.MethodGet, "https://cdn.example.com/video.mp4", nil)
+	reqB.Header.Set("Range", "bytes=5-9")
+	reqB.Header.Set("Origin", "https://b.example.com")
+
+	var wg sync.WaitGroup
+	errs := make(chan error, 2)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		_, err := cache.Handle(context.Background(), reqA, policy, fetch)
+		errs <- err
+	}()
+	go func() {
+		defer wg.Done()
+		_, err := cache.Handle(context.Background(), reqB, policy, fetch)
+		errs <- err
+	}()
+
+	close(block)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("range handle failed: %v", err)
+		}
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if counts["https://a.example.com"] != 1 || counts["https://b.example.com"] != 1 {
+		t.Fatalf("expected one origin-specific fill per origin, got %#v", counts)
 	}
 }
