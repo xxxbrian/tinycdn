@@ -193,7 +193,7 @@ func TestRouterStreamsOversizedObjectsWithoutCaching(t *testing.T) {
 	defer upstream.Close()
 
 	router := newTestRouter(t, newTestSnapshot(t, upstream.URL))
-	router.fetcher.maxBufferedObjectBytes = 4
+	router.fetcher.maxCacheableObjectBytes = 4
 	defer router.Close()
 
 	req := httptest.NewRequest(http.MethodGet, "http://cdn.example.com/assets/app.js", nil)

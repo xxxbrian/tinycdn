@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -20,24 +22,26 @@ import (
 
 const (
 	defaultUpstreamTimeout        = 60 * time.Second
-	defaultMaxBufferedObjectBytes = 32 << 20
+	defaultMaxCacheableObjectSize = 10 << 30
 )
 
 var ErrUpstreamResponseTooLarge = errors.New("upstream response exceeds buffered object limit")
 
 type upstreamFetcher struct {
-	client                 *http.Client
-	maxBufferedObjectBytes int64
+	client                  *http.Client
+	maxCacheableObjectBytes int64
+	tempDir                 string
 }
 
-func newUpstreamFetcher() *upstreamFetcher {
+func newUpstreamFetcher(cachePath string) *upstreamFetcher {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	return &upstreamFetcher{
 		client: &http.Client{
 			Transport: transport,
 			Timeout:   defaultUpstreamTimeout,
 		},
-		maxBufferedObjectBytes: defaultMaxBufferedObjectBytes,
+		maxCacheableObjectBytes: defaultMaxCacheableObjectSize,
+		tempDir:                 filepath.Join(cachePath, "tmp"),
 	}
 }
 
@@ -48,19 +52,39 @@ func (f *upstreamFetcher) Fetch(ctx context.Context, req *http.Request, site *ru
 	}
 	defer resp.Body.Close()
 
-	if responseTooLarge(resp, f.maxBufferedObjectBytes) {
+	if responseTooLarge(resp, f.maxCacheableObjectBytes) {
 		return cache.StoredResponse{}, ErrUpstreamResponseTooLarge
 	}
 
-	body, err := readLimitedBody(resp.Body, f.maxBufferedObjectBytes)
+	if err := os.MkdirAll(f.tempDir, 0o755); err != nil {
+		return cache.StoredResponse{}, err
+	}
+	tempFile, err := os.CreateTemp(f.tempDir, "body-*")
 	if err != nil {
+		return cache.StoredResponse{}, err
+	}
+	defer tempFile.Close()
+
+	size, err := io.Copy(tempFile, io.LimitReader(resp.Body, f.maxCacheableObjectBytes+1))
+	if err != nil {
+		_ = os.Remove(tempFile.Name())
+		return cache.StoredResponse{}, err
+	}
+	if size > f.maxCacheableObjectBytes {
+		_ = os.Remove(tempFile.Name())
+		return cache.StoredResponse{}, ErrUpstreamResponseTooLarge
+	}
+	if err := tempFile.Close(); err != nil {
+		_ = os.Remove(tempFile.Name())
 		return cache.StoredResponse{}, err
 	}
 
 	return cache.StoredResponse{
-		StatusCode: resp.StatusCode,
-		Header:     resp.Header.Clone(),
-		Body:       body,
+		StatusCode:    resp.StatusCode,
+		Header:        resp.Header.Clone(),
+		BodyPath:      tempFile.Name(),
+		ContentLength: contentLength(resp, size),
+		CleanupPath:   true,
 	}, nil
 }
 
@@ -110,16 +134,11 @@ func responseTooLarge(resp *http.Response, maxBytes int64) bool {
 	return resp.ContentLength > maxBytes && resp.ContentLength >= 0
 }
 
-func readLimitedBody(body io.Reader, maxBytes int64) ([]byte, error) {
-	limited := &io.LimitedReader{R: body, N: maxBytes + 1}
-	payload, err := io.ReadAll(limited)
-	if err != nil {
-		return nil, err
+func contentLength(resp *http.Response, copied int64) int64 {
+	if resp.ContentLength >= 0 {
+		return resp.ContentLength
 	}
-	if int64(len(payload)) > maxBytes {
-		return nil, ErrUpstreamResponseTooLarge
-	}
-	return payload, nil
+	return copied
 }
 
 func applyForwardedHeaders(upstreamReq *http.Request, req *http.Request) {

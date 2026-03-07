@@ -47,9 +47,12 @@ type Policy struct {
 }
 
 type StoredResponse struct {
-	StatusCode int
-	Header     http.Header
-	Body       []byte
+	StatusCode    int
+	Header        http.Header
+	Body          []byte
+	BodyPath      string
+	ContentLength int64
+	CleanupPath   bool
 }
 
 type Entry struct {
@@ -66,11 +69,14 @@ type Entry struct {
 }
 
 type Result struct {
-	State       State
-	StatusCode  int
-	Header      http.Header
-	Body        []byte
-	CacheStatus string
+	State         State
+	StatusCode    int
+	Header        http.Header
+	Body          []byte
+	BodyPath      string
+	ContentLength int64
+	CleanupPath   bool
+	CacheStatus   string
 }
 
 type FetchFunc func(context.Context, *http.Request) (StoredResponse, error)
@@ -143,11 +149,17 @@ func (e *Engine) Handle(ctx context.Context, req *http.Request, policy Policy, f
 
 	decision := decideStore(now, policy, response)
 	if decision.Store && shouldStoreResponse(req.Method) {
+		response, err = e.persistResponseBody(ctx, response)
+		if err != nil {
+			return Result{}, err
+		}
 		cacheKey = buildStorageKey(baseKey, decision.VaryHeaders, preparedReq.Header)
 		entry := buildEntry(now, cacheKey, policy, decision, response)
 		if err := e.storeResponse(ctx, baseKey, entry, decision.VaryHeaders); err != nil {
+			response.CleanupPath = true
 			return buildResult(StateMiss, response, missCacheStatus(cacheKey, false, combineStatusDetails(lookupErr, "STORE_ERROR"))), nil
 		}
+		response.CleanupPath = false
 		return buildResult(StateMiss, response, missCacheStatus(cacheKey, true, combineStatusDetails(lookupErr))), nil
 	}
 
@@ -170,6 +182,11 @@ func (e *Engine) refreshInBackground(ctx context.Context, cacheKey string, req *
 		decision := decideStore(e.now(), policy, response)
 		if !decision.Store || !shouldStoreResponse(req.Method) {
 			return nil, nil
+		}
+
+		response, err = e.persistResponseBody(refreshCtx, response)
+		if err != nil {
+			return nil, err
 		}
 
 		now := e.now()
@@ -254,6 +271,7 @@ func (e *Engine) storeResponse(ctx context.Context, baseKey string, entry Entry,
 			return err
 		}
 		_ = e.store.Delete(ctx, varyKey(baseKey))
+		_ = e.store.Delete(ctx, responseKey(baseKey))
 		return e.store.PutEntry(ctx, responseKey(baseKey), entry)
 	}
 
@@ -265,10 +283,28 @@ func (e *Engine) storeResponse(ctx context.Context, baseKey string, entry Entry,
 	if err := e.store.Delete(ctx, responseKey(baseKey)); err != nil {
 		return err
 	}
+	_ = e.store.Delete(ctx, entry.Key)
 	if err := e.store.PutVary(ctx, varyKey(baseKey), VarySpec{Headers: varyHeaders}); err != nil {
 		return err
 	}
 	return e.store.PutEntry(ctx, entry.Key, entry)
+}
+
+func (e *Engine) persistResponseBody(ctx context.Context, response StoredResponse) (StoredResponse, error) {
+	if response.BodyPath == "" || !response.CleanupPath {
+		if response.ContentLength == 0 && response.Body != nil {
+			response.ContentLength = int64(len(response.Body))
+		}
+		return response, nil
+	}
+
+	finalPath, err := e.store.ImportBody(ctx, response.BodyPath)
+	if err != nil {
+		return StoredResponse{}, err
+	}
+	response.BodyPath = finalPath
+	response.CleanupPath = false
+	return response, nil
 }
 
 func buildEntry(now time.Time, cacheKey string, policy Policy, decision storeDecision, response StoredResponse) Entry {
@@ -283,10 +319,15 @@ func buildEntry(now time.Time, cacheKey string, policy Policy, decision storeDec
 		InvalidAt:  now.Add(decision.TTL + decision.StaleWindow + decision.StaleIfError),
 		BaseAge:    parseAge(response.Header.Get("Age")),
 		Response: StoredResponse{
-			StatusCode: response.StatusCode,
-			Header:     sanitizeStoredHeader(response.Header),
-			Body:       append([]byte(nil), response.Body...),
+			StatusCode:    response.StatusCode,
+			Header:        sanitizeStoredHeader(response.Header),
+			Body:          append([]byte(nil), response.Body...),
+			BodyPath:      response.BodyPath,
+			ContentLength: response.ContentLength,
 		},
+	}
+	if entry.Response.ContentLength == 0 && entry.Response.Body != nil {
+		entry.Response.ContentLength = int64(len(entry.Response.Body))
 	}
 	if entry.InvalidAt.Before(entry.StoredAt) {
 		entry.InvalidAt = entry.StoredAt
@@ -375,12 +416,19 @@ func decideStore(now time.Time, policy Policy, response StoredResponse) storeDec
 }
 
 func buildResult(state State, response StoredResponse, cacheStatus string) Result {
+	contentLength := response.ContentLength
+	if contentLength == 0 && response.Body != nil {
+		contentLength = int64(len(response.Body))
+	}
 	return Result{
-		State:       state,
-		StatusCode:  response.StatusCode,
-		Header:      sanitizeStoredHeader(response.Header),
-		Body:        append([]byte(nil), response.Body...),
-		CacheStatus: cacheStatus,
+		State:         state,
+		StatusCode:    response.StatusCode,
+		Header:        sanitizeStoredHeader(response.Header),
+		Body:          append([]byte(nil), response.Body...),
+		BodyPath:      response.BodyPath,
+		ContentLength: contentLength,
+		CleanupPath:   response.CleanupPath,
+		CacheStatus:   cacheStatus,
 	}
 }
 
@@ -390,11 +438,13 @@ func entryResult(entry Entry, state State, now time.Time) Result {
 
 	cacheStatus := hitCacheStatus(entry, state, now)
 	return Result{
-		State:       state,
-		StatusCode:  entry.Response.StatusCode,
-		Header:      header,
-		Body:        append([]byte(nil), entry.Response.Body...),
-		CacheStatus: cacheStatus,
+		State:         state,
+		StatusCode:    entry.Response.StatusCode,
+		Header:        header,
+		Body:          append([]byte(nil), entry.Response.Body...),
+		BodyPath:      entry.Response.BodyPath,
+		ContentLength: entry.Response.ContentLength,
+		CacheStatus:   cacheStatus,
 	}
 }
 

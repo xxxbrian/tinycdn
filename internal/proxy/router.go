@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strconv"
 
 	"tinycdn/internal/cache"
@@ -36,7 +37,7 @@ func NewRouter(snapshot func() *runtime.Snapshot, cachePath string) (*Router, er
 	return &Router{
 		engine:   cache.NewEngine(store),
 		store:    store,
-		fetcher:  newUpstreamFetcher(),
+		fetcher:  newUpstreamFetcher(cachePath),
 		snapshot: snapshot,
 	}, nil
 }
@@ -104,10 +105,23 @@ func writeResult(rw http.ResponseWriter, req *http.Request, site *runtime.Compil
 	header.Set(headerTinyCDNSite, site.Source.ID)
 	header.Set(headerTinyCDNRule, rule.Source.ID)
 	header.Set(headerCacheStatus, result.CacheStatus)
-	header.Set("Content-Length", strconv.Itoa(len(result.Body)))
+	header.Set("Content-Length", strconv.FormatInt(result.ContentLength, 10))
 
 	rw.WriteHeader(result.StatusCode)
+	if result.CleanupPath {
+		defer func() { _ = os.Remove(result.BodyPath) }()
+	}
 	if req.Method == http.MethodHead {
+		return
+	}
+	if result.BodyPath != "" {
+		body, err := os.Open(result.BodyPath)
+		if err != nil {
+			http.Error(rw, fmt.Sprintf("proxy body open error: %v", err), http.StatusInternalServerError)
+			return
+		}
+		defer body.Close()
+		_, _ = io.Copy(rw, body)
 		return
 	}
 	_, _ = rw.Write(result.Body)

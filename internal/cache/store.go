@@ -5,8 +5,12 @@ import (
 	"context"
 	"encoding/gob"
 	"errors"
+	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/dgraph-io/badger/v4"
@@ -25,23 +29,28 @@ type Store interface {
 	PutEntry(ctx context.Context, key string, entry Entry) error
 	GetVary(ctx context.Context, key string) (VarySpec, bool, error)
 	PutVary(ctx context.Context, key string, spec VarySpec) error
+	ImportBody(ctx context.Context, tempPath string) (string, error)
 	Delete(ctx context.Context, key string) error
 	DeletePrefix(ctx context.Context, prefix string) (int, error)
 	Close() error
 }
 
 type BadgerStore struct {
-	db *badger.DB
+	db      *badger.DB
+	blobDir string
 }
 
 func NewBadgerStore(path string) (*BadgerStore, error) {
 	options := badger.DefaultOptions(path).WithLogger(nil)
+	if err := os.MkdirAll(filepath.Join(path, "blobs"), 0o755); err != nil {
+		return nil, err
+	}
 	db, err := badger.Open(options)
 	if err != nil {
 		return nil, err
 	}
 
-	return &BadgerStore{db: db}, nil
+	return &BadgerStore{db: db, blobDir: filepath.Join(path, "blobs")}, nil
 }
 
 func (s *BadgerStore) GetEntry(ctx context.Context, key string) (Entry, bool, error) {
@@ -146,14 +155,48 @@ func (s *BadgerStore) PutVary(ctx context.Context, key string, spec VarySpec) er
 	})
 }
 
+func (s *BadgerStore) ImportBody(ctx context.Context, tempPath string) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+
+	finalPath := filepath.Join(s.blobDir, filepath.Base(tempPath))
+	if err := os.MkdirAll(s.blobDir, 0o755); err != nil {
+		return "", err
+	}
+	if err := os.Rename(tempPath, finalPath); err != nil {
+		return "", err
+	}
+	return finalPath, nil
+}
+
 func (s *BadgerStore) Delete(ctx context.Context, key string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 
-	return s.db.Update(func(txn *badger.Txn) error {
+	var (
+		entry Entry
+		found bool
+		err   error
+	)
+	if strings.HasPrefix(key, "resp|") {
+		entry, found, err = s.GetEntry(ctx, key)
+		if err != nil {
+			return err
+		}
+	}
+
+	err = s.db.Update(func(txn *badger.Txn) error {
 		return txn.Delete([]byte(key))
 	})
+	if err != nil {
+		return err
+	}
+	if found {
+		_ = removeBodyPath(entry.Response.BodyPath)
+	}
+	return nil
 }
 
 func (s *BadgerStore) DeletePrefix(ctx context.Context, prefix string) (int, error) {
@@ -162,14 +205,30 @@ func (s *BadgerStore) DeletePrefix(ctx context.Context, prefix string) (int, err
 	}
 
 	keys := make([][]byte, 0)
+	blobPaths := make([]string, 0)
 	err := s.db.View(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
-		opts.PrefetchValues = false
 		it := txn.NewIterator(opts)
 		defer it.Close()
 
 		for it.Seek([]byte(prefix)); it.ValidForPrefix([]byte(prefix)); it.Next() {
-			keys = append(keys, slices.Clone(it.Item().Key()))
+			item := it.Item()
+			keys = append(keys, slices.Clone(item.Key()))
+			if !strings.HasPrefix(string(item.Key()), "resp|") {
+				continue
+			}
+			if err := item.Value(func(value []byte) error {
+				entry, err := decodeEntry(append([]byte(nil), value...))
+				if err != nil {
+					return err
+				}
+				if entry.Response.BodyPath != "" {
+					blobPaths = append(blobPaths, entry.Response.BodyPath)
+				}
+				return nil
+			}); err != nil {
+				return err
+			}
 		}
 		return nil
 	})
@@ -190,6 +249,9 @@ func (s *BadgerStore) DeletePrefix(ctx context.Context, prefix string) (int, err
 	})
 	if err != nil {
 		return 0, err
+	}
+	for _, bodyPath := range blobPaths {
+		_ = removeBodyPath(bodyPath)
 	}
 
 	return len(keys), nil
@@ -227,4 +289,14 @@ func decodeVarySpec(payload []byte) (VarySpec, error) {
 	var spec VarySpec
 	err := gob.NewDecoder(bytes.NewReader(payload)).Decode(&spec)
 	return spec, err
+}
+
+func removeBodyPath(path string) error {
+	if path == "" {
+		return nil
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("remove body %q: %w", path, err)
+	}
+	return nil
 }

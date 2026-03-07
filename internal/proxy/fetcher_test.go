@@ -8,7 +8,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"strings"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"tinycdn/internal/model"
@@ -150,16 +151,9 @@ func TestBuildUpstreamRequestAddsForwardingHeaders(t *testing.T) {
 }
 
 func TestNewUpstreamFetcherConfiguresTimeout(t *testing.T) {
-	fetcher := newUpstreamFetcher()
+	fetcher := newUpstreamFetcher(t.TempDir())
 	if fetcher.client.Timeout != defaultUpstreamTimeout {
 		t.Fatalf("expected upstream timeout %s, got %s", defaultUpstreamTimeout, fetcher.client.Timeout)
-	}
-}
-
-func TestReadLimitedBodyRejectsOversizedResponses(t *testing.T) {
-	_, err := readLimitedBody(strings.NewReader("toolarge"), 4)
-	if !errors.Is(err, ErrUpstreamResponseTooLarge) {
-		t.Fatalf("expected oversized body error, got %v", err)
 	}
 }
 
@@ -178,8 +172,9 @@ func TestFetchRejectsOversizedContentLengthBeforeBuffering(t *testing.T) {
 		t.Fatalf("parse upstream: %v", err)
 	}
 
-	fetcher := newUpstreamFetcher()
-	fetcher.maxBufferedObjectBytes = 4
+	cachePath := t.TempDir()
+	fetcher := newUpstreamFetcher(cachePath)
+	fetcher.maxCacheableObjectBytes = 4
 	site := &runtime.CompiledSite{
 		Upstream:     upstreamURL,
 		UpstreamMode: model.UpstreamHostModeFollowOrigin,
@@ -194,5 +189,53 @@ func TestFetchRejectsOversizedContentLengthBeforeBuffering(t *testing.T) {
 	}
 	if upstreamHits != 1 {
 		t.Fatalf("expected one upstream hit, got %d", upstreamHits)
+	}
+}
+
+func TestFetchWritesBodyToTempFile(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		rw.Header().Set("Content-Length", "7")
+		rw.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(rw, "payload")
+	}))
+	defer upstream.Close()
+
+	upstreamURL, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream: %v", err)
+	}
+
+	cachePath := t.TempDir()
+	fetcher := newUpstreamFetcher(cachePath)
+	site := &runtime.CompiledSite{
+		Upstream:     upstreamURL,
+		UpstreamMode: model.UpstreamHostModeFollowOrigin,
+		UpstreamHost: upstreamURL.Host,
+	}
+	req := httptest.NewRequest(http.MethodGet, "https://cdn.example.com/assets/app.js", nil)
+	req.Host = "cdn.example.com"
+
+	response, err := fetcher.Fetch(context.Background(), req, site)
+	if err != nil {
+		t.Fatalf("fetch: %v", err)
+	}
+	if response.BodyPath == "" {
+		t.Fatalf("expected temp body path to be set")
+	}
+	if !response.CleanupPath {
+		t.Fatalf("expected fetched temp body to request cleanup before store adoption")
+	}
+	if response.ContentLength != 7 {
+		t.Fatalf("expected content length 7, got %d", response.ContentLength)
+	}
+	payload, err := os.ReadFile(response.BodyPath)
+	if err != nil {
+		t.Fatalf("read temp body: %v", err)
+	}
+	if string(payload) != "payload" {
+		t.Fatalf("unexpected temp body %q", string(payload))
+	}
+	if filepath.Dir(response.BodyPath) != filepath.Join(cachePath, "tmp") {
+		t.Fatalf("expected temp body under cache tmp dir, got %q", response.BodyPath)
 	}
 }

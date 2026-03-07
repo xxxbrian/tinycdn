@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -59,9 +60,16 @@ func (s *memoryStore) PutVary(_ context.Context, key string, spec VarySpec) erro
 	return nil
 }
 
+func (s *memoryStore) ImportBody(_ context.Context, tempPath string) (string, error) {
+	return tempPath, nil
+}
+
 func (s *memoryStore) Delete(_ context.Context, key string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if entry, ok := s.entries[key]; ok {
+		_ = os.Remove(entry.Response.BodyPath)
+	}
 	delete(s.entries, key)
 	delete(s.varies, key)
 	return nil
@@ -73,6 +81,7 @@ func (s *memoryStore) DeletePrefix(_ context.Context, prefix string) (int, error
 	deleted := 0
 	for key := range s.entries {
 		if strings.HasPrefix(key, prefix) {
+			_ = os.Remove(s.entries[key].Response.BodyPath)
 			delete(s.entries, key)
 			deleted++
 		}
@@ -108,6 +117,10 @@ func (s *errorStore) PutVary(_ context.Context, _ string, _ VarySpec) error {
 
 func (s *errorStore) Delete(_ context.Context, _ string) error {
 	return nil
+}
+
+func (s *errorStore) ImportBody(_ context.Context, _ string) (string, error) {
+	return "", s.putErr
 }
 
 func (s *errorStore) DeletePrefix(_ context.Context, _ string) (int, error) {
