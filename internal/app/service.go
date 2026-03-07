@@ -1,8 +1,11 @@
 package app
 
 import (
+	"context"
 	"fmt"
+	"net/url"
 	"slices"
+	"strings"
 	"sync"
 
 	"github.com/google/uuid"
@@ -15,9 +18,15 @@ import (
 type Service struct {
 	store   *config.Store
 	runtime *runtime.Manager
+	cache   CacheController
 
 	mu     sync.RWMutex
 	config model.AppConfig
+}
+
+type CacheController interface {
+	PurgeSite(context.Context, string) (int, error)
+	PurgeURL(context.Context, string, string, string) (int, error)
 }
 
 func NewService(store *config.Store, runtimeManager *runtime.Manager, cfg model.AppConfig) *Service {
@@ -26,6 +35,12 @@ func NewService(store *config.Store, runtimeManager *runtime.Manager, cfg model.
 		runtime: runtimeManager,
 		config:  cfg,
 	}
+}
+
+func (s *Service) SetCacheController(controller CacheController) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cache = controller
 }
 
 func (s *Service) RuntimeSnapshot() *runtime.Snapshot {
@@ -315,6 +330,82 @@ func (s *Service) ReorderRules(siteID string, ruleIDs []string) ([]model.Rule, e
 	}
 
 	return site.Rules, nil
+}
+
+type PurgeCacheInput struct {
+	All  bool     `json:"all,omitempty"`
+	URLs []string `json:"urls,omitempty"`
+}
+
+type PurgeCacheResult struct {
+	Purged int      `json:"purged"`
+	Scope  string   `json:"scope"`
+	URLs   []string `json:"urls,omitempty"`
+}
+
+func (s *Service) PurgeCache(ctx context.Context, siteID string, input PurgeCacheInput) (PurgeCacheResult, error) {
+	site, ok := s.GetSite(siteID)
+	if !ok {
+		return PurgeCacheResult{}, fmt.Errorf("site %q not found", siteID)
+	}
+
+	s.mu.RLock()
+	controller := s.cache
+	s.mu.RUnlock()
+	if controller == nil {
+		return PurgeCacheResult{}, fmt.Errorf("cache controller unavailable")
+	}
+
+	switch {
+	case input.All && len(input.URLs) == 0:
+		purged, err := controller.PurgeSite(ctx, siteID)
+		if err != nil {
+			return PurgeCacheResult{}, err
+		}
+		return PurgeCacheResult{Purged: purged, Scope: "site"}, nil
+	case !input.All && len(input.URLs) > 0:
+		purged := 0
+		for _, rawURL := range input.URLs {
+			parsed, err := parseSitePurgeURL(site, rawURL)
+			if err != nil {
+				return PurgeCacheResult{}, err
+			}
+			deleted, err := controller.PurgeURL(ctx, siteID, parsed.Path, parsed.RawQuery)
+			if err != nil {
+				return PurgeCacheResult{}, err
+			}
+			purged += deleted
+		}
+		return PurgeCacheResult{Purged: purged, Scope: "url", URLs: append([]string(nil), input.URLs...)}, nil
+	default:
+		return PurgeCacheResult{}, fmt.Errorf("purge request must specify either all=true or one or more urls")
+	}
+}
+
+func parseSitePurgeURL(site model.Site, rawValue string) (*url.URL, error) {
+	if rawValue == "" {
+		return nil, fmt.Errorf("purge url cannot be empty")
+	}
+
+	if strings.HasPrefix(rawValue, "/") {
+		parsed, err := url.ParseRequestURI(rawValue)
+		if err != nil {
+			return nil, fmt.Errorf("invalid purge url %q: %w", rawValue, err)
+		}
+		return parsed, nil
+	}
+
+	parsed, err := url.Parse(rawValue)
+	if err != nil {
+		return nil, fmt.Errorf("invalid purge url %q: %w", rawValue, err)
+	}
+	if parsed.Scheme == "" || parsed.Host == "" {
+		return nil, fmt.Errorf("purge url %q must be an absolute URL or an absolute path", rawValue)
+	}
+	if !slices.Contains(site.Hosts, parsed.Hostname()) {
+		return nil, fmt.Errorf("purge url host %q does not belong to site %q", parsed.Hostname(), site.ID)
+	}
+	return parsed, nil
 }
 
 func findSite(sites []model.Site, id string) (model.Site, error) {

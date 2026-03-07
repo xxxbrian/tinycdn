@@ -42,6 +42,14 @@ func (r *Router) Close() error {
 	return r.store.Close()
 }
 
+func (r *Router) PurgeSite(ctx context.Context, siteID string) (int, error) {
+	return r.engine.PurgeSite(ctx, siteID)
+}
+
+func (r *Router) PurgeURL(ctx context.Context, siteID, path, rawQuery string) (int, error) {
+	return r.engine.PurgeURL(ctx, siteID, path, rawQuery)
+}
+
 func (r *Router) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	if req.URL.Path == "/healthz" {
 		rw.WriteHeader(http.StatusOK)

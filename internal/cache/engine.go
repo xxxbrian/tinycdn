@@ -2,8 +2,11 @@ package cache
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -113,13 +116,9 @@ func (e *Engine) Handle(ctx context.Context, req *http.Request, policy Policy, f
 	}
 
 	keyMethod := cacheKeyMethod(req.Method)
-	cacheKey := buildCacheKey(policy.SiteID, keyMethod, req.URL.Path, req.URL.RawQuery)
+	baseKey := buildBaseCacheKey(policy.SiteID, keyMethod, req.URL.Path, req.URL.RawQuery)
+	cacheKey, entry, found := e.lookupEntry(ctx, baseKey, preparedReq.Header)
 	now := e.now()
-
-	entry, found, err := e.store.Get(ctx, cacheKey)
-	if err != nil {
-		found = false
-	}
 
 	if found && entry.PolicyTag == policy.PolicyTag {
 		if !now.After(entry.FreshUntil) && !shouldForceRefresh(req, policy) {
@@ -142,29 +141,9 @@ func (e *Engine) Handle(ctx context.Context, req *http.Request, policy Policy, f
 
 	decision := decideStore(now, policy, response)
 	if decision.Store && shouldStoreResponse(req.Method) {
-		entry := Entry{
-			Key:        cacheKey,
-			SiteID:     policy.SiteID,
-			RuleID:     policy.RuleID,
-			PolicyTag:  policy.PolicyTag,
-			StoredAt:   now,
-			FreshUntil: now.Add(decision.TTL),
-			StaleUntil: now.Add(decision.TTL + decision.StaleWindow),
-			InvalidAt:  now.Add(decision.TTL + decision.StaleWindow + decision.StaleIfError),
-			BaseAge:    parseAge(response.Header.Get("Age")),
-			Response: StoredResponse{
-				StatusCode: response.StatusCode,
-				Header:     sanitizeStoredHeader(response.Header),
-				Body:       append([]byte(nil), response.Body...),
-			},
-		}
-		if entry.InvalidAt.Before(entry.StoredAt) {
-			entry.InvalidAt = entry.StoredAt
-		}
-		if entry.StaleUntil.Before(entry.FreshUntil) {
-			entry.StaleUntil = entry.FreshUntil
-		}
-		_ = e.store.Put(ctx, cacheKey, entry)
+		cacheKey = buildStorageKey(baseKey, decision.VaryHeaders, preparedReq.Header)
+		entry := buildEntry(now, cacheKey, policy, decision, response)
+		_ = e.storeResponse(ctx, baseKey, entry, decision.VaryHeaders)
 		return buildResult(StateMiss, response, missCacheStatus(cacheKey, true)), nil
 	}
 
@@ -187,31 +166,111 @@ func (e *Engine) refreshInBackground(ctx context.Context, cacheKey string, req *
 		}
 
 		now := e.now()
-		entry := Entry{
-			Key:        cacheKey,
-			SiteID:     policy.SiteID,
-			RuleID:     policy.RuleID,
-			PolicyTag:  policy.PolicyTag,
-			StoredAt:   now,
-			FreshUntil: now.Add(decision.TTL),
-			StaleUntil: now.Add(decision.TTL + decision.StaleWindow),
-			InvalidAt:  now.Add(decision.TTL + decision.StaleWindow + decision.StaleIfError),
-			BaseAge:    parseAge(response.Header.Get("Age")),
-			Response: StoredResponse{
-				StatusCode: response.StatusCode,
-				Header:     sanitizeStoredHeader(response.Header),
-				Body:       append([]byte(nil), response.Body...),
-			},
-		}
-		if entry.StaleUntil.Before(entry.FreshUntil) {
-			entry.StaleUntil = entry.FreshUntil
-		}
-		if entry.InvalidAt.Before(entry.StoredAt) {
-			entry.InvalidAt = entry.StoredAt
-		}
-
-		return nil, e.store.Put(refreshCtx, cacheKey, entry)
+		baseKey := buildBaseCacheKey(policy.SiteID, cacheKeyMethod(req.Method), req.URL.Path, req.URL.RawQuery)
+		nextKey := buildStorageKey(baseKey, decision.VaryHeaders, req.Header)
+		entry := buildEntry(now, nextKey, policy, decision, response)
+		return nil, e.storeResponse(refreshCtx, baseKey, entry, decision.VaryHeaders)
 	})
+}
+
+func (e *Engine) PurgeSite(ctx context.Context, siteID string) (int, error) {
+	respDeleted, err := e.store.DeletePrefix(ctx, responseSitePrefix(siteID))
+	if err != nil {
+		return 0, err
+	}
+	varyDeleted, err := e.store.DeletePrefix(ctx, varySitePrefix(siteID))
+	if err != nil {
+		return respDeleted, err
+	}
+	return respDeleted + varyDeleted, nil
+}
+
+func (e *Engine) PurgeURL(ctx context.Context, siteID, path, rawQuery string) (int, error) {
+	baseKey := buildBaseCacheKey(siteID, http.MethodGet, path, rawQuery)
+
+	deleted := 0
+	if _, found, err := e.store.GetEntry(ctx, responseKey(baseKey)); err == nil && found {
+		if err := e.store.Delete(ctx, responseKey(baseKey)); err != nil {
+			return deleted, err
+		}
+		deleted++
+	}
+	if _, found, err := e.store.GetVary(ctx, varyKey(baseKey)); err == nil && found {
+		if err := e.store.Delete(ctx, varyKey(baseKey)); err != nil {
+			return deleted, err
+		}
+		deleted++
+	}
+
+	variantDeleted, err := e.store.DeletePrefix(ctx, variantPrefix(baseKey))
+	if err != nil {
+		return deleted, err
+	}
+	return deleted + variantDeleted, nil
+}
+
+func (e *Engine) lookupEntry(ctx context.Context, baseKey string, requestHeader http.Header) (string, Entry, bool) {
+	cacheKey := responseKey(baseKey)
+
+	spec, found, err := e.store.GetVary(ctx, varyKey(baseKey))
+	if err == nil && found && len(spec.Headers) > 0 {
+		cacheKey = buildVariantKey(baseKey, spec.Headers, requestHeader)
+	}
+
+	entry, found, err := e.store.GetEntry(ctx, cacheKey)
+	if err != nil {
+		return cacheKey, Entry{}, false
+	}
+	return cacheKey, entry, found
+}
+
+func (e *Engine) storeResponse(ctx context.Context, baseKey string, entry Entry, varyHeaders []string) error {
+	if len(varyHeaders) == 0 {
+		if _, err := e.store.DeletePrefix(ctx, variantPrefix(baseKey)); err != nil {
+			return err
+		}
+		_ = e.store.Delete(ctx, varyKey(baseKey))
+		return e.store.PutEntry(ctx, responseKey(baseKey), entry)
+	}
+
+	if existing, found, err := e.store.GetVary(ctx, varyKey(baseKey)); err == nil && found && !slices.Equal(existing.Headers, varyHeaders) {
+		if _, err := e.store.DeletePrefix(ctx, variantPrefix(baseKey)); err != nil {
+			return err
+		}
+	}
+	if err := e.store.Delete(ctx, responseKey(baseKey)); err != nil {
+		return err
+	}
+	if err := e.store.PutVary(ctx, varyKey(baseKey), VarySpec{Headers: varyHeaders}); err != nil {
+		return err
+	}
+	return e.store.PutEntry(ctx, entry.Key, entry)
+}
+
+func buildEntry(now time.Time, cacheKey string, policy Policy, decision storeDecision, response StoredResponse) Entry {
+	entry := Entry{
+		Key:        cacheKey,
+		SiteID:     policy.SiteID,
+		RuleID:     policy.RuleID,
+		PolicyTag:  policy.PolicyTag,
+		StoredAt:   now,
+		FreshUntil: now.Add(decision.TTL),
+		StaleUntil: now.Add(decision.TTL + decision.StaleWindow),
+		InvalidAt:  now.Add(decision.TTL + decision.StaleWindow + decision.StaleIfError),
+		BaseAge:    parseAge(response.Header.Get("Age")),
+		Response: StoredResponse{
+			StatusCode: response.StatusCode,
+			Header:     sanitizeStoredHeader(response.Header),
+			Body:       append([]byte(nil), response.Body...),
+		},
+	}
+	if entry.InvalidAt.Before(entry.StoredAt) {
+		entry.InvalidAt = entry.StoredAt
+	}
+	if entry.StaleUntil.Before(entry.FreshUntil) {
+		entry.StaleUntil = entry.FreshUntil
+	}
+	return entry
 }
 
 type storeDecision struct {
@@ -219,6 +278,7 @@ type storeDecision struct {
 	TTL          time.Duration
 	StaleWindow  time.Duration
 	StaleIfError time.Duration
+	VaryHeaders  []string
 }
 
 func decideStore(now time.Time, policy Policy, response StoredResponse) storeDecision {
@@ -244,6 +304,10 @@ func decideStore(now time.Time, policy Policy, response StoredResponse) storeDec
 		if policy.Optimistic {
 			staleWindow = maxDuration(staleWindow, policy.OptimisticMaxStale)
 		}
+		varyHeaders, cacheable := parseVary(response.Header.Values("Vary"))
+		if !cacheable {
+			return storeDecision{}
+		}
 
 		staleIfError := directives.staleIfError
 		return storeDecision{
@@ -251,6 +315,7 @@ func decideStore(now time.Time, policy Policy, response StoredResponse) storeDec
 			TTL:          ttl,
 			StaleWindow:  staleWindow,
 			StaleIfError: staleIfError,
+			VaryHeaders:  varyHeaders,
 		}
 	default:
 		ttl := policy.TTL
@@ -267,12 +332,17 @@ func decideStore(now time.Time, policy Policy, response StoredResponse) storeDec
 		if policy.HasStaleIfError {
 			staleIfError = policy.StaleIfError
 		}
+		varyHeaders, cacheable := parseVary(response.Header.Values("Vary"))
+		if !cacheable {
+			return storeDecision{}
+		}
 
 		return storeDecision{
 			Store:        true,
 			TTL:          ttl,
 			StaleWindow:  staleWindow,
 			StaleIfError: staleIfError,
+			VaryHeaders:  varyHeaders,
 		}
 	}
 }
@@ -361,12 +431,57 @@ func cacheKeyMethod(method string) string {
 	return method
 }
 
-func buildCacheKey(siteID, method, path, rawQuery string) string {
+func buildBaseCacheKey(siteID, method, path, rawQuery string) string {
 	key := siteID + "|" + method + "|" + path
 	if rawQuery != "" {
 		key += "?" + rawQuery
 	}
 	return key
+}
+
+func responseKey(baseKey string) string {
+	return "resp|" + baseKey
+}
+
+func varyKey(baseKey string) string {
+	return "vary|" + baseKey
+}
+
+func variantPrefix(baseKey string) string {
+	return responseKey(baseKey) + "|vary|"
+}
+
+func responseSitePrefix(siteID string) string {
+	return "resp|" + siteID + "|"
+}
+
+func varySitePrefix(siteID string) string {
+	return "vary|" + siteID + "|"
+}
+
+func buildStorageKey(baseKey string, varyHeaders []string, requestHeader http.Header) string {
+	if len(varyHeaders) == 0 {
+		return responseKey(baseKey)
+	}
+	return buildVariantKey(baseKey, varyHeaders, requestHeader)
+}
+
+func buildVariantKey(baseKey string, varyHeaders []string, requestHeader http.Header) string {
+	sum := sha256.Sum256([]byte(buildVariantFingerprint(varyHeaders, requestHeader)))
+	return variantPrefix(baseKey) + hex.EncodeToString(sum[:])
+}
+
+func buildVariantFingerprint(varyHeaders []string, requestHeader http.Header) string {
+	parts := make([]string, 0, len(varyHeaders))
+	for _, headerName := range varyHeaders {
+		values := requestHeader.Values(headerName)
+		if len(values) == 0 {
+			parts = append(parts, headerName+"=")
+			continue
+		}
+		parts = append(parts, headerName+"="+strings.Join(values, ","))
+	}
+	return strings.Join(parts, "\n")
 }
 
 func sanitizeStoredHeader(header http.Header) http.Header {
@@ -443,6 +558,29 @@ func parseAge(value string) int {
 		return 0
 	}
 	return age
+}
+
+func parseVary(values []string) ([]string, bool) {
+	headers := make([]string, 0)
+	seen := map[string]struct{}{}
+	for _, value := range values {
+		for _, part := range strings.Split(value, ",") {
+			headerName := http.CanonicalHeaderKey(strings.TrimSpace(part))
+			switch headerName {
+			case "":
+				continue
+			case "*":
+				return nil, false
+			}
+			if _, ok := seen[headerName]; ok {
+				continue
+			}
+			seen[headerName] = struct{}{}
+			headers = append(headers, headerName)
+		}
+	}
+	slices.Sort(headers)
+	return headers, true
 }
 
 type cacheControlDirectives struct {

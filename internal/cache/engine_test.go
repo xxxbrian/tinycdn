@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -14,23 +15,41 @@ import (
 type memoryStore struct {
 	mu      sync.RWMutex
 	entries map[string]Entry
+	varies  map[string]VarySpec
 }
 
 func newMemoryStore() *memoryStore {
-	return &memoryStore{entries: map[string]Entry{}}
+	return &memoryStore{
+		entries: map[string]Entry{},
+		varies:  map[string]VarySpec{},
+	}
 }
 
-func (s *memoryStore) Get(_ context.Context, key string) (Entry, bool, error) {
+func (s *memoryStore) GetEntry(_ context.Context, key string) (Entry, bool, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	entry, ok := s.entries[key]
 	return entry, ok, nil
 }
 
-func (s *memoryStore) Put(_ context.Context, key string, entry Entry) error {
+func (s *memoryStore) PutEntry(_ context.Context, key string, entry Entry) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.entries[key] = entry
+	return nil
+}
+
+func (s *memoryStore) GetVary(_ context.Context, key string) (VarySpec, bool, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	spec, ok := s.varies[key]
+	return spec, ok, nil
+}
+
+func (s *memoryStore) PutVary(_ context.Context, key string, spec VarySpec) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.varies[key] = spec
 	return nil
 }
 
@@ -38,7 +57,27 @@ func (s *memoryStore) Delete(_ context.Context, key string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.entries, key)
+	delete(s.varies, key)
 	return nil
+}
+
+func (s *memoryStore) DeletePrefix(_ context.Context, prefix string) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	deleted := 0
+	for key := range s.entries {
+		if strings.HasPrefix(key, prefix) {
+			delete(s.entries, key)
+			deleted++
+		}
+	}
+	for key := range s.varies {
+		if strings.HasPrefix(key, prefix) {
+			delete(s.varies, key)
+			deleted++
+		}
+	}
+	return deleted, nil
 }
 
 func (s *memoryStore) Close() error {
@@ -243,5 +282,118 @@ func TestEngineFollowOriginRespectsCacheControl(t *testing.T) {
 	}
 	if fetches != 1 {
 		t.Fatalf("expected one upstream fetch, got %d", fetches)
+	}
+}
+
+func TestEngineVarySeparatesVariants(t *testing.T) {
+	store := newMemoryStore()
+	engine := NewEngine(store)
+	now := time.Date(2026, time.March, 7, 0, 0, 0, 0, time.UTC)
+	engine.now = func() time.Time { return now }
+
+	policy := Policy{
+		SiteID:    "site-1",
+		RuleID:    "rule-1",
+		PolicyTag: "rule-1|origin",
+		Mode:      model.CacheModeFollowOrigin,
+	}
+
+	fetches := 0
+	fetch := func(_ context.Context, req *http.Request) (StoredResponse, error) {
+		fetches++
+		body := "identity"
+		if strings.Contains(req.Header.Get("Accept-Encoding"), "gzip") {
+			body = "gzip"
+		}
+		return StoredResponse{
+			StatusCode: http.StatusOK,
+			Header: http.Header{
+				"Cache-Control":    {"public, max-age=60"},
+				"Vary":             {"Accept-Encoding"},
+				"Content-Type":     {"text/plain"},
+				"Content-Encoding": {body},
+			},
+			Body: []byte(body),
+		}, nil
+	}
+
+	gzipReq := httptest.NewRequest(http.MethodGet, "https://cdn.example.com/assets/app.js", nil)
+	gzipReq.Header.Set("Accept-Encoding", "gzip")
+	identityReq := httptest.NewRequest(http.MethodGet, "https://cdn.example.com/assets/app.js", nil)
+
+	first, err := engine.Handle(context.Background(), gzipReq, policy, fetch)
+	if err != nil {
+		t.Fatalf("prime gzip variant: %v", err)
+	}
+	if first.State != StateMiss {
+		t.Fatalf("expected gzip prime to miss, got %s", first.State)
+	}
+
+	second, err := engine.Handle(context.Background(), gzipReq, policy, fetch)
+	if err != nil {
+		t.Fatalf("gzip hit: %v", err)
+	}
+	if second.State != StateHit || string(second.Body) != "gzip" {
+		t.Fatalf("expected gzip variant hit, got %s body=%q", second.State, string(second.Body))
+	}
+
+	third, err := engine.Handle(context.Background(), identityReq, policy, fetch)
+	if err != nil {
+		t.Fatalf("identity fetch: %v", err)
+	}
+	if third.State != StateMiss || string(third.Body) != "identity" {
+		t.Fatalf("expected identity variant miss, got %s body=%q", third.State, string(third.Body))
+	}
+
+	if fetches != 2 {
+		t.Fatalf("expected two upstream fetches for two vary variants, got %d", fetches)
+	}
+}
+
+func TestEnginePurgeURLClearsAllVariants(t *testing.T) {
+	store := newMemoryStore()
+	engine := NewEngine(store)
+	now := time.Date(2026, time.March, 7, 0, 0, 0, 0, time.UTC)
+	engine.now = func() time.Time { return now }
+
+	policy := Policy{
+		SiteID:    "site-1",
+		RuleID:    "rule-1",
+		PolicyTag: "rule-1|origin",
+		Mode:      model.CacheModeFollowOrigin,
+	}
+
+	fetch := func(_ context.Context, req *http.Request) (StoredResponse, error) {
+		body := "identity"
+		if strings.Contains(req.Header.Get("Accept-Encoding"), "gzip") {
+			body = "gzip"
+		}
+		return StoredResponse{
+			StatusCode: http.StatusOK,
+			Header: http.Header{
+				"Cache-Control": {"public, max-age=60"},
+				"Vary":          {"Accept-Encoding"},
+			},
+			Body: []byte(body),
+		}, nil
+	}
+
+	gzipReq := httptest.NewRequest(http.MethodGet, "https://cdn.example.com/assets/app.js?rev=1", nil)
+	gzipReq.Header.Set("Accept-Encoding", "gzip")
+	identityReq := httptest.NewRequest(http.MethodGet, "https://cdn.example.com/assets/app.js?rev=1", nil)
+
+	if _, err := engine.Handle(context.Background(), gzipReq, policy, fetch); err != nil {
+		t.Fatalf("prime gzip variant: %v", err)
+	}
+	if _, err := engine.Handle(context.Background(), identityReq, policy, fetch); err != nil {
+		t.Fatalf("prime identity variant: %v", err)
+	}
+
+	deleted, err := engine.PurgeURL(context.Background(), "site-1", "/assets/app.js", "rev=1")
+	if err != nil {
+		t.Fatalf("purge url: %v", err)
+	}
+	if deleted != 3 {
+		t.Fatalf("expected 3 deleted records (2 variants + 1 vary spec), got %d", deleted)
 	}
 }

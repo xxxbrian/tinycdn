@@ -54,15 +54,15 @@ func main() {
 
 	runtimeManager := runtime.NewManager(snapshot)
 	service := app.NewService(store, runtimeManager, cfg)
-
-	adminServer := &http.Server{
-		Addr:    *adminAddr,
-		Handler: admin.NewRouter(service, *uiDir),
-	}
 	proxyRouter, err := proxy.NewRouter(service.RuntimeSnapshot, *cacheDir)
 	if err != nil {
 		logger.Error("failed to initialize proxy router", "error", err)
 		os.Exit(1)
+	}
+	service.SetCacheController(proxyRouter)
+	adminServer := &http.Server{
+		Addr:    *adminAddr,
+		Handler: admin.NewRouter(service, *uiDir),
 	}
 	defer func() {
 		if err := proxyRouter.Close(); err != nil {

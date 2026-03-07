@@ -38,6 +38,7 @@ func NewRouter(service *app.Service, uiDir string) http.Handler {
 		api.Put("/sites/{siteID}/rules/{ruleID}", router.updateRule)
 		api.Delete("/sites/{siteID}/rules/{ruleID}", router.deleteRule)
 		api.Post("/sites/{siteID}/rules/reorder", router.reorderRules)
+		api.Post("/sites/{siteID}/cache/purge", router.purgeCache)
 	})
 
 	r.Handle("/*", router.uiHandler())
@@ -194,6 +195,26 @@ func (r *Router) reorderRules(rw http.ResponseWriter, req *http.Request) {
 	}
 
 	writeJSON(rw, http.StatusOK, rules)
+}
+
+func (r *Router) purgeCache(rw http.ResponseWriter, req *http.Request) {
+	var payload app.PurgeCacheInput
+	if err := decodeJSON(req, &payload); err != nil {
+		writeError(rw, http.StatusBadRequest, err)
+		return
+	}
+
+	result, err := r.service.PurgeCache(req.Context(), chi.URLParam(req, "siteID"), payload)
+	if err != nil {
+		status := http.StatusBadRequest
+		if strings.Contains(err.Error(), "not found") {
+			status = http.StatusNotFound
+		}
+		writeError(rw, status, err)
+		return
+	}
+
+	writeJSON(rw, http.StatusOK, result)
 }
 
 func (r *Router) uiHandler() http.Handler {

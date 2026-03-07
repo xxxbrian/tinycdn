@@ -6,6 +6,7 @@ import (
 	"encoding/gob"
 	"errors"
 	"net/http"
+	"slices"
 	"time"
 
 	"github.com/dgraph-io/badger/v4"
@@ -15,10 +16,17 @@ func init() {
 	gob.Register(http.Header{})
 }
 
+type VarySpec struct {
+	Headers []string
+}
+
 type Store interface {
-	Get(ctx context.Context, key string) (Entry, bool, error)
-	Put(ctx context.Context, key string, entry Entry) error
+	GetEntry(ctx context.Context, key string) (Entry, bool, error)
+	PutEntry(ctx context.Context, key string, entry Entry) error
+	GetVary(ctx context.Context, key string) (VarySpec, bool, error)
+	PutVary(ctx context.Context, key string, spec VarySpec) error
 	Delete(ctx context.Context, key string) error
+	DeletePrefix(ctx context.Context, prefix string) (int, error)
 	Close() error
 }
 
@@ -36,7 +44,7 @@ func NewBadgerStore(path string) (*BadgerStore, error) {
 	return &BadgerStore{db: db}, nil
 }
 
-func (s *BadgerStore) Get(ctx context.Context, key string) (Entry, bool, error) {
+func (s *BadgerStore) GetEntry(ctx context.Context, key string) (Entry, bool, error) {
 	if err := ctx.Err(); err != nil {
 		return Entry{}, false, err
 	}
@@ -68,7 +76,7 @@ func (s *BadgerStore) Get(ctx context.Context, key string) (Entry, bool, error) 
 	return entry, true, nil
 }
 
-func (s *BadgerStore) Put(ctx context.Context, key string, entry Entry) error {
+func (s *BadgerStore) PutEntry(ctx context.Context, key string, entry Entry) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -91,6 +99,53 @@ func (s *BadgerStore) Put(ctx context.Context, key string, entry Entry) error {
 	})
 }
 
+func (s *BadgerStore) GetVary(ctx context.Context, key string) (VarySpec, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return VarySpec{}, false, err
+	}
+
+	var payload []byte
+	err := s.db.View(func(txn *badger.Txn) error {
+		item, err := txn.Get([]byte(key))
+		if err != nil {
+			return err
+		}
+
+		return item.Value(func(value []byte) error {
+			payload = append([]byte(nil), value...)
+			return nil
+		})
+	})
+	if errors.Is(err, badger.ErrKeyNotFound) {
+		return VarySpec{}, false, nil
+	}
+	if err != nil {
+		return VarySpec{}, false, err
+	}
+
+	spec, err := decodeVarySpec(payload)
+	if err != nil {
+		return VarySpec{}, false, err
+	}
+
+	return spec, true, nil
+}
+
+func (s *BadgerStore) PutVary(ctx context.Context, key string, spec VarySpec) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	payload, err := encodeVarySpec(spec)
+	if err != nil {
+		return err
+	}
+
+	return s.db.Update(func(txn *badger.Txn) error {
+		return txn.Set([]byte(key), payload)
+	})
+}
+
 func (s *BadgerStore) Delete(ctx context.Context, key string) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -99,6 +154,45 @@ func (s *BadgerStore) Delete(ctx context.Context, key string) error {
 	return s.db.Update(func(txn *badger.Txn) error {
 		return txn.Delete([]byte(key))
 	})
+}
+
+func (s *BadgerStore) DeletePrefix(ctx context.Context, prefix string) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+
+	keys := make([][]byte, 0)
+	err := s.db.View(func(txn *badger.Txn) error {
+		opts := badger.DefaultIteratorOptions
+		opts.PrefetchValues = false
+		it := txn.NewIterator(opts)
+		defer it.Close()
+
+		for it.Seek([]byte(prefix)); it.ValidForPrefix([]byte(prefix)); it.Next() {
+			keys = append(keys, slices.Clone(it.Item().Key()))
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	if len(keys) == 0 {
+		return 0, nil
+	}
+
+	err = s.db.Update(func(txn *badger.Txn) error {
+		for _, key := range keys {
+			if err := txn.Delete(key); err != nil && !errors.Is(err, badger.ErrKeyNotFound) {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+
+	return len(keys), nil
 }
 
 func (s *BadgerStore) Close() error {
@@ -118,4 +212,19 @@ func decodeEntry(payload []byte) (Entry, error) {
 	var entry Entry
 	err := gob.NewDecoder(bytes.NewReader(payload)).Decode(&entry)
 	return entry, err
+}
+
+func encodeVarySpec(spec VarySpec) ([]byte, error) {
+	var buffer bytes.Buffer
+	if err := gob.NewEncoder(&buffer).Encode(spec); err != nil {
+		return nil, err
+	}
+
+	return buffer.Bytes(), nil
+}
+
+func decodeVarySpec(payload []byte) (VarySpec, error) {
+	var spec VarySpec
+	err := gob.NewDecoder(bytes.NewReader(payload)).Decode(&spec)
+	return spec, err
 }
