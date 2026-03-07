@@ -162,3 +162,60 @@ func TestRangeCachePurgeURLRemovesRangeMetadataAndChunks(t *testing.T) {
 		t.Fatalf("expected chunk removed, found=%t err=%v", found, err)
 	}
 }
+
+func TestRangeCacheManagedOriginSeparatesChunkVariants(t *testing.T) {
+	store := newMemoryStore()
+	cache := NewRangeCache(store)
+	now := time.Date(2026, time.March, 7, 0, 0, 0, 0, time.UTC)
+	cache.now = func() time.Time { return now }
+
+	policy := Policy{
+		SiteID:    "site-1",
+		RuleID:    "rule-1",
+		PolicyTag: "rule-1|force",
+		Mode:      model.CacheModeForceCache,
+		TTL:       time.Minute,
+		HasTTL:    true,
+	}
+
+	fetches := 0
+	fetch := func(_ context.Context, req *http.Request) (StoredResponse, error) {
+		fetches++
+		origin := req.Header.Get("Origin")
+		header := http.Header{
+			"Content-Range":               {"bytes 0-25/26"},
+			"Content-Type":                {"text/plain"},
+			"Access-Control-Allow-Origin": {origin},
+		}
+		return StoredResponse{
+			StatusCode:    http.StatusPartialContent,
+			Header:        header,
+			Body:          []byte("abcdefghijklmnopqrstuvwxyz"),
+			ContentLength: 26,
+		}, nil
+	}
+
+	reqA := httptest.NewRequest(http.MethodGet, "https://cdn.example.com/video.mp4", nil)
+	reqA.Header.Set("Range", "bytes=5-9")
+	reqA.Header.Set("Origin", "https://a.example.com")
+	reqB := httptest.NewRequest(http.MethodGet, "https://cdn.example.com/video.mp4", nil)
+	reqB.Header.Set("Range", "bytes=5-9")
+	reqB.Header.Set("Origin", "https://b.example.com")
+
+	if _, err := cache.Handle(context.Background(), reqA, policy, fetch); err != nil {
+		t.Fatalf("origin a range miss: %v", err)
+	}
+	if _, err := cache.Handle(context.Background(), reqB, policy, fetch); err != nil {
+		t.Fatalf("origin b range miss: %v", err)
+	}
+	hitA, err := cache.Handle(context.Background(), reqA, policy, fetch)
+	if err != nil {
+		t.Fatalf("origin a range hit: %v", err)
+	}
+	if hitA.State != StateHit {
+		t.Fatalf("expected origin a range hit, got %s", hitA.State)
+	}
+	if fetches != 2 {
+		t.Fatalf("expected two origin-specific chunk fills, got %d", fetches)
+	}
+}

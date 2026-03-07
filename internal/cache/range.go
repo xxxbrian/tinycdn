@@ -210,14 +210,11 @@ func (c *RangeCache) lookupFreshFullObject(ctx context.Context, req *http.Reques
 }
 
 func (c *RangeCache) lookupRegularEntry(ctx context.Context, baseKey string, requestHeader http.Header) (string, Entry, bool, error) {
-	cacheKey := responseKey(baseKey)
 	spec, found, err := c.store.GetVary(ctx, varyKey(baseKey))
 	if err != nil {
-		return cacheKey, Entry{}, false, err
+		return responseKey(baseKey), Entry{}, false, err
 	}
-	if found && len(spec.Headers) > 0 {
-		cacheKey = buildVariantKey(baseKey, spec.Headers, requestHeader)
-	}
+	cacheKey := lookupStorageKey(baseKey, requestHeader, spec, found)
 	entry, found, err := c.store.GetEntry(ctx, cacheKey)
 	if err != nil {
 		return cacheKey, Entry{}, false, err
@@ -226,14 +223,11 @@ func (c *RangeCache) lookupRegularEntry(ctx context.Context, baseKey string, req
 }
 
 func (c *RangeCache) lookupChunkObject(ctx context.Context, baseKey string, requestHeader http.Header) (string, ChunkObject, bool, error, error) {
-	storageKey := responseKey(baseKey)
 	spec, found, err := c.store.GetVary(ctx, rangeVaryKey(baseKey))
 	if err != nil {
-		return storageKey, ChunkObject{}, false, err, err
+		return responseKey(baseKey), ChunkObject{}, false, err, err
 	}
-	if found && len(spec.Headers) > 0 {
-		storageKey = buildVariantKey(baseKey, spec.Headers, requestHeader)
-	}
+	storageKey := lookupStorageKey(baseKey, requestHeader, spec, found)
 	object, found, err := c.store.GetChunkObject(ctx, rangeObjectKey(storageKey))
 	if err != nil {
 		return storageKey, ChunkObject{}, false, err, err
@@ -474,6 +468,7 @@ func (c *RangeCache) fetchChunk(ctx context.Context, req *http.Request, policy P
 		return StoredResponse{}, ChunkObject{}, "", storeDecision{}, false, ErrRangeBypass
 	}
 	decision := decideChunkStore(c.now(), policy, response)
+	decision.VaryHeaders = effectiveVaryHeaders(req.Header, response.Header, decision.VaryHeaders)
 	objectKey := buildStorageKey(
 		buildBaseCacheKey(policy.SiteID, http.MethodGet, req.URL.Path, req.URL.RawQuery),
 		decision.VaryHeaders,

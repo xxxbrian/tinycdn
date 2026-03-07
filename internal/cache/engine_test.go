@@ -694,6 +694,137 @@ func TestEngineVaryNormalizesAcceptEncodingFormatting(t *testing.T) {
 	}
 }
 
+func TestEngineManagedOriginSeparatesCORSVariants(t *testing.T) {
+	store := newMemoryStore()
+	engine := NewEngine(store)
+	now := time.Date(2026, time.March, 7, 0, 0, 0, 0, time.UTC)
+	engine.now = func() time.Time { return now }
+
+	policy := Policy{
+		SiteID:    "site-1",
+		RuleID:    "rule-1",
+		PolicyTag: "rule-1|follow",
+		Mode:      model.CacheModeFollowOrigin,
+	}
+
+	fetches := 0
+	fetch := func(_ context.Context, req *http.Request) (StoredResponse, error) {
+		fetches++
+		header := http.Header{
+			"Cache-Control": {"public, max-age=30"},
+			"Content-Type":  {"text/plain"},
+		}
+		if origin := req.Header.Get("Origin"); origin != "" {
+			header.Set("Access-Control-Allow-Origin", origin)
+			return StoredResponse{
+				StatusCode: http.StatusOK,
+				Header:     header,
+				Body:       []byte("cors-" + origin),
+			}, nil
+		}
+		return StoredResponse{
+			StatusCode: http.StatusOK,
+			Header:     header,
+			Body:       []byte("plain"),
+		}, nil
+	}
+
+	plainReq := httptest.NewRequest(http.MethodGet, "https://cdn.example.com/assets/app.js", nil)
+	plain, err := engine.Handle(context.Background(), plainReq, policy, fetch)
+	if err != nil {
+		t.Fatalf("plain handle: %v", err)
+	}
+	if plain.State != StateMiss {
+		t.Fatalf("expected plain miss, got %s", plain.State)
+	}
+
+	originReq := httptest.NewRequest(http.MethodGet, "https://cdn.example.com/assets/app.js", nil)
+	originReq.Header.Set("Origin", "https://app.example.com")
+	originMiss, err := engine.Handle(context.Background(), originReq, policy, fetch)
+	if err != nil {
+		t.Fatalf("origin miss handle: %v", err)
+	}
+	if originMiss.State != StateMiss {
+		t.Fatalf("expected first origin request miss, got %s", originMiss.State)
+	}
+	if string(originMiss.Body) != "cors-https://app.example.com" {
+		t.Fatalf("unexpected origin body %q", string(originMiss.Body))
+	}
+
+	originHit, err := engine.Handle(context.Background(), originReq, policy, fetch)
+	if err != nil {
+		t.Fatalf("origin hit handle: %v", err)
+	}
+	if originHit.State != StateHit {
+		t.Fatalf("expected repeated origin request hit, got %s", originHit.State)
+	}
+	if string(originHit.Body) != "cors-https://app.example.com" {
+		t.Fatalf("unexpected origin hit body %q", string(originHit.Body))
+	}
+
+	if fetches != 2 {
+		t.Fatalf("expected two fetches (plain + origin), got %d", fetches)
+	}
+
+	spec, found, err := store.GetVary(context.Background(), varyKey(buildBaseCacheKey("site-1", http.MethodGet, "/assets/app.js", "")))
+	if err != nil || !found {
+		t.Fatalf("expected vary spec, found=%t err=%v", found, err)
+	}
+	if len(spec.Headers) != 1 || spec.Headers[0] != "Origin" {
+		t.Fatalf("expected managed origin vary, got %#v", spec.Headers)
+	}
+}
+
+func TestEngineManagedOriginSeparatesDifferentOrigins(t *testing.T) {
+	store := newMemoryStore()
+	engine := NewEngine(store)
+	now := time.Date(2026, time.March, 7, 0, 0, 0, 0, time.UTC)
+	engine.now = func() time.Time { return now }
+
+	policy := Policy{
+		SiteID:    "site-1",
+		RuleID:    "rule-1",
+		PolicyTag: "rule-1|follow",
+		Mode:      model.CacheModeFollowOrigin,
+	}
+
+	fetches := 0
+	fetch := func(_ context.Context, req *http.Request) (StoredResponse, error) {
+		fetches++
+		origin := req.Header.Get("Origin")
+		return StoredResponse{
+			StatusCode: http.StatusOK,
+			Header: http.Header{
+				"Cache-Control":               {"public, max-age=30"},
+				"Access-Control-Allow-Origin": {origin},
+			},
+			Body: []byte(origin),
+		}, nil
+	}
+
+	reqA := httptest.NewRequest(http.MethodGet, "https://cdn.example.com/assets/app.js", nil)
+	reqA.Header.Set("Origin", "https://a.example.com")
+	reqB := httptest.NewRequest(http.MethodGet, "https://cdn.example.com/assets/app.js", nil)
+	reqB.Header.Set("Origin", "https://b.example.com")
+
+	if _, err := engine.Handle(context.Background(), reqA, policy, fetch); err != nil {
+		t.Fatalf("origin a miss: %v", err)
+	}
+	if _, err := engine.Handle(context.Background(), reqB, policy, fetch); err != nil {
+		t.Fatalf("origin b miss: %v", err)
+	}
+	hitA, err := engine.Handle(context.Background(), reqA, policy, fetch)
+	if err != nil {
+		t.Fatalf("origin a hit: %v", err)
+	}
+	if hitA.State != StateHit || string(hitA.Body) != "https://a.example.com" {
+		t.Fatalf("unexpected origin a hit state/body %s %q", hitA.State, string(hitA.Body))
+	}
+	if fetches != 2 {
+		t.Fatalf("expected two variant fetches, got %d", fetches)
+	}
+}
+
 func TestEnginePurgeURLClearsAllVariants(t *testing.T) {
 	store := newMemoryStore()
 	engine := NewEngine(store)

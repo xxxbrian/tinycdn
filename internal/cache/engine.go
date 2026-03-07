@@ -282,6 +282,7 @@ func (e *Engine) CompleteFill(ctx context.Context, plan *FillPlan, response Stor
 	if !decision.Store || !shouldStoreResponse(plan.originalMethod) {
 		return cleanupResponsePath(response)
 	}
+	decision.VaryHeaders = effectiveVaryHeaders(plan.PreparedRequest.Header, response.Header, decision.VaryHeaders)
 
 	response, err := e.persistResponseBody(ctx, response)
 	if err != nil {
@@ -351,6 +352,7 @@ func (e *Engine) refreshInBackground(ctx context.Context, cacheKey string, req *
 		if !decision.Store || !shouldStoreResponse(req.Method) {
 			return nil, nil
 		}
+		decision.VaryHeaders = effectiveVaryHeaders(req.Header, response.Header, decision.VaryHeaders)
 
 		response, err = e.persistResponseBody(refreshCtx, response)
 		if err != nil {
@@ -424,15 +426,11 @@ func (e *Engine) PurgeURL(ctx context.Context, siteID, path, rawQuery string) (i
 }
 
 func (e *Engine) lookupEntry(ctx context.Context, baseKey string, requestHeader http.Header) (string, Entry, bool, error) {
-	cacheKey := responseKey(baseKey)
-
 	spec, found, err := e.store.GetVary(ctx, varyKey(baseKey))
 	if err != nil {
-		return cacheKey, Entry{}, false, err
+		return responseKey(baseKey), Entry{}, false, err
 	}
-	if found && len(spec.Headers) > 0 {
-		cacheKey = buildVariantKey(baseKey, spec.Headers, requestHeader)
-	}
+	cacheKey := lookupStorageKey(baseKey, requestHeader, spec, found)
 
 	entry, found, err := e.store.GetEntry(ctx, cacheKey)
 	if err != nil {
@@ -729,6 +727,17 @@ func buildStorageKey(baseKey string, varyHeaders []string, requestHeader http.He
 	return buildVariantKey(baseKey, varyHeaders, requestHeader)
 }
 
+func lookupStorageKey(baseKey string, requestHeader http.Header, spec VarySpec, found bool) string {
+	if found && len(spec.Headers) > 0 {
+		return buildVariantKey(baseKey, spec.Headers, requestHeader)
+	}
+	managed := effectiveVaryHeaders(requestHeader, nil, nil)
+	if len(managed) > 0 {
+		return buildVariantKey(baseKey, managed, requestHeader)
+	}
+	return responseKey(baseKey)
+}
+
 func buildVariantKey(baseKey string, varyHeaders []string, requestHeader http.Header) string {
 	sum := sha256.Sum256([]byte(buildVariantFingerprint(varyHeaders, requestHeader)))
 	return variantPrefix(baseKey) + hex.EncodeToString(sum[:])
@@ -763,6 +772,41 @@ func normalizeVaryHeaderValue(headerName string, values []string) string {
 		}
 		return strings.Join(normalized, ",")
 	}
+}
+
+func effectiveVaryHeaders(requestHeader http.Header, responseHeader http.Header, varyHeaders []string) []string {
+	headers := slices.Clone(varyHeaders)
+	if shouldManagedVaryOnOrigin(requestHeader, responseHeader) {
+		headers = append(headers, "Origin")
+	}
+	if len(headers) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(headers))
+	deduped := make([]string, 0, len(headers))
+	for _, headerName := range headers {
+		canonical := http.CanonicalHeaderKey(strings.TrimSpace(headerName))
+		if canonical == "" {
+			continue
+		}
+		if _, ok := seen[canonical]; ok {
+			continue
+		}
+		seen[canonical] = struct{}{}
+		deduped = append(deduped, canonical)
+	}
+	slices.Sort(deduped)
+	return deduped
+}
+
+func shouldManagedVaryOnOrigin(requestHeader http.Header, responseHeader http.Header) bool {
+	if len(requestHeader.Values("Origin")) > 0 {
+		return true
+	}
+	if responseHeader == nil {
+		return false
+	}
+	return strings.TrimSpace(responseHeader.Get("Access-Control-Allow-Origin")) != ""
 }
 
 func normalizeCommaSeparatedTokens(values []string, lower bool) string {
