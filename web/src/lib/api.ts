@@ -1,7 +1,11 @@
 import type {
+  AnalyticsPeriod,
+  AnalyticsReport,
+  AuditLogPage,
   PurgeCachePayload,
   PurgeCacheResult,
   ReorderPayload,
+  RequestLogPage,
   Rule,
   Site,
   SiteInput,
@@ -82,6 +86,53 @@ export const api = {
       method: "POST",
       body: JSON.stringify(payload),
     }),
+  analyticsReport: (period: AnalyticsPeriod, siteId?: string) =>
+    request<AnalyticsReport>(
+      withQuery(siteId ? `/api/sites/${siteId}/analytics/report` : "/api/analytics/report", {
+        period,
+      }),
+    ),
+  requestLogs: (params: {
+    period: AnalyticsPeriod;
+    siteId?: string;
+    limit?: number;
+    cursor?: string;
+    method?: string;
+    cacheState?: string;
+    statusClass?: string;
+    pathPrefix?: string;
+    search?: string;
+    includeInternal?: boolean;
+  }) =>
+    request<RequestLogPage>(
+      withQuery(
+        params.siteId ? `/api/sites/${params.siteId}/logs/requests` : "/api/logs/requests",
+        {
+          period: params.period,
+          limit: params.limit,
+          cursor: params.cursor,
+          method: params.method,
+          cache_state: params.cacheState,
+          status_class: params.statusClass,
+          path_prefix: params.pathPrefix,
+          search: params.search,
+          include_internal: params.includeInternal ? "true" : undefined,
+        },
+      ),
+    ),
+  auditLogs: (params: {
+    period: AnalyticsPeriod;
+    siteId?: string;
+    limit?: number;
+    cursor?: string;
+  }) =>
+    request<AuditLogPage>(
+      withQuery(params.siteId ? `/api/sites/${params.siteId}/logs/audit` : "/api/logs/audit", {
+        period: params.period,
+        limit: params.limit,
+        cursor: params.cursor,
+      }),
+    ),
 };
 
 export function toSiteInput(site: Site, overrides: Partial<SiteInput> = {}): SiteInput {
@@ -95,4 +146,16 @@ export function toSiteInput(site: Site, overrides: Partial<SiteInput> = {}): Sit
     upstream_host: site.upstream.host ?? "",
     ...overrides,
   };
+}
+
+function withQuery(path: string, params: Record<string, string | number | undefined>) {
+  const query = new URLSearchParams();
+  for (const [key, value] of Object.entries(params)) {
+    if (value === undefined || value === "") {
+      continue;
+    }
+    query.set(key, String(value));
+  }
+  const suffix = query.toString();
+  return suffix ? `${path}?${suffix}` : path;
 }
