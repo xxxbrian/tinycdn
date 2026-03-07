@@ -151,7 +151,10 @@ func TestBuildUpstreamRequestAddsForwardingHeaders(t *testing.T) {
 }
 
 func TestNewUpstreamFetcherConfiguresTimeout(t *testing.T) {
-	fetcher := newUpstreamFetcher(t.TempDir())
+	fetcher, err := newUpstreamFetcher(t.TempDir())
+	if err != nil {
+		t.Fatalf("new upstream fetcher: %v", err)
+	}
 	if fetcher.client.Timeout != defaultUpstreamTimeout {
 		t.Fatalf("expected upstream timeout %s, got %s", defaultUpstreamTimeout, fetcher.client.Timeout)
 	}
@@ -173,7 +176,10 @@ func TestFetchRejectsOversizedContentLengthBeforeBuffering(t *testing.T) {
 	}
 
 	cachePath := t.TempDir()
-	fetcher := newUpstreamFetcher(cachePath)
+	fetcher, err := newUpstreamFetcher(cachePath)
+	if err != nil {
+		t.Fatalf("new upstream fetcher: %v", err)
+	}
 	fetcher.maxCacheableObjectBytes = 4
 	site := &runtime.CompiledSite{
 		Upstream:     upstreamURL,
@@ -206,7 +212,10 @@ func TestFetchWritesBodyToTempFile(t *testing.T) {
 	}
 
 	cachePath := t.TempDir()
-	fetcher := newUpstreamFetcher(cachePath)
+	fetcher, err := newUpstreamFetcher(cachePath)
+	if err != nil {
+		t.Fatalf("new upstream fetcher: %v", err)
+	}
 	site := &runtime.CompiledSite{
 		Upstream:     upstreamURL,
 		UpstreamMode: model.UpstreamHostModeFollowOrigin,
@@ -237,5 +246,40 @@ func TestFetchWritesBodyToTempFile(t *testing.T) {
 	}
 	if filepath.Dir(response.BodyPath) != filepath.Join(cachePath, "tmp") {
 		t.Fatalf("expected temp body under cache tmp dir, got %q", response.BodyPath)
+	}
+}
+
+func TestNewUpstreamFetcherCleansTempDirectory(t *testing.T) {
+	cachePath := t.TempDir()
+	tempDir := filepath.Join(cachePath, "tmp")
+	if err := os.MkdirAll(tempDir, 0o755); err != nil {
+		t.Fatalf("mkdir temp dir: %v", err)
+	}
+	staleFile := filepath.Join(tempDir, "stale-body")
+	if err := os.WriteFile(staleFile, []byte("stale"), 0o644); err != nil {
+		t.Fatalf("write stale file: %v", err)
+	}
+	staleDir := filepath.Join(tempDir, "stale-dir")
+	if err := os.MkdirAll(staleDir, 0o755); err != nil {
+		t.Fatalf("mkdir stale dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(staleDir, "nested"), []byte("nested"), 0o644); err != nil {
+		t.Fatalf("write stale nested file: %v", err)
+	}
+
+	fetcher, err := newUpstreamFetcher(cachePath)
+	if err != nil {
+		t.Fatalf("new upstream fetcher: %v", err)
+	}
+	if fetcher.tempDir != tempDir {
+		t.Fatalf("expected temp dir %q, got %q", tempDir, fetcher.tempDir)
+	}
+
+	entries, err := os.ReadDir(tempDir)
+	if err != nil {
+		t.Fatalf("read temp dir: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("expected temp cleanup to remove stale startup files, got %d entries", len(entries))
 	}
 }

@@ -2,7 +2,9 @@ package cache
 
 import (
 	"context"
+	"errors"
 	"net/http"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -126,5 +128,113 @@ func TestBadgerStoreDeletePrefixAndExpiredWrite(t *testing.T) {
 	}
 	if _, found, err := store.GetEntry(context.Background(), expired.Key); err != nil || found {
 		t.Fatalf("expected expired entry to be removed, found=%v err=%v", found, err)
+	}
+}
+
+func TestBadgerStorePutEntryReplacesOldBlob(t *testing.T) {
+	store, err := NewBadgerStore(filepath.Join(t.TempDir(), "badger"))
+	if err != nil {
+		t.Fatalf("new badger store: %v", err)
+	}
+	defer store.Close()
+
+	tempOne := filepath.Join(t.TempDir(), "body-one")
+	if err := os.WriteFile(tempOne, []byte("first"), 0o644); err != nil {
+		t.Fatalf("write temp one: %v", err)
+	}
+	blobOne, err := store.ImportBody(context.Background(), tempOne)
+	if err != nil {
+		t.Fatalf("import body one: %v", err)
+	}
+
+	entry := Entry{
+		Key:        "resp|site-1|GET|/asset.js",
+		StoredAt:   time.Now().UTC(),
+		FreshUntil: time.Now().UTC().Add(time.Minute),
+		StaleUntil: time.Now().UTC().Add(2 * time.Minute),
+		InvalidAt:  time.Now().UTC().Add(3 * time.Minute),
+		Response: StoredResponse{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": {"application/javascript"}},
+			BodyPath:   blobOne,
+		},
+	}
+	if err := store.PutEntry(context.Background(), entry.Key, entry); err != nil {
+		t.Fatalf("put first entry: %v", err)
+	}
+
+	tempTwo := filepath.Join(t.TempDir(), "body-two")
+	if err := os.WriteFile(tempTwo, []byte("second"), 0o644); err != nil {
+		t.Fatalf("write temp two: %v", err)
+	}
+	blobTwo, err := store.ImportBody(context.Background(), tempTwo)
+	if err != nil {
+		t.Fatalf("import body two: %v", err)
+	}
+
+	entry.Response.BodyPath = blobTwo
+	if err := store.PutEntry(context.Background(), entry.Key, entry); err != nil {
+		t.Fatalf("replace entry: %v", err)
+	}
+
+	if _, err := os.Stat(blobOne); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected replaced blob to be removed, err=%v", err)
+	}
+	if _, err := os.Stat(blobTwo); err != nil {
+		t.Fatalf("expected latest blob to remain, err=%v", err)
+	}
+}
+
+func TestBadgerStorePrunesOrphanBlobsOnOpen(t *testing.T) {
+	cachePath := filepath.Join(t.TempDir(), "badger")
+	store, err := NewBadgerStore(cachePath)
+	if err != nil {
+		t.Fatalf("new badger store: %v", err)
+	}
+
+	tempLive := filepath.Join(t.TempDir(), "live-body")
+	if err := os.WriteFile(tempLive, []byte("live"), 0o644); err != nil {
+		t.Fatalf("write live temp body: %v", err)
+	}
+	blobLive, err := store.ImportBody(context.Background(), tempLive)
+	if err != nil {
+		t.Fatalf("import live body: %v", err)
+	}
+
+	entry := Entry{
+		Key:        "resp|site-1|GET|/asset.js",
+		StoredAt:   time.Now().UTC(),
+		FreshUntil: time.Now().UTC().Add(time.Minute),
+		StaleUntil: time.Now().UTC().Add(2 * time.Minute),
+		InvalidAt:  time.Now().UTC().Add(3 * time.Minute),
+		Response: StoredResponse{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": {"application/javascript"}},
+			BodyPath:   blobLive,
+		},
+	}
+	if err := store.PutEntry(context.Background(), entry.Key, entry); err != nil {
+		t.Fatalf("put entry: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	orphanPath := filepath.Join(cachePath, "blobs", "orphan-body")
+	if err := os.WriteFile(orphanPath, []byte("orphan"), 0o644); err != nil {
+		t.Fatalf("write orphan body: %v", err)
+	}
+
+	reopened, err := NewBadgerStore(cachePath)
+	if err != nil {
+		t.Fatalf("reopen badger store: %v", err)
+	}
+	defer reopened.Close()
+
+	if _, err := os.Stat(blobLive); err != nil {
+		t.Fatalf("expected referenced blob to remain, err=%v", err)
+	}
+	if _, err := os.Stat(orphanPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected orphan blob to be removed, err=%v", err)
 	}
 }

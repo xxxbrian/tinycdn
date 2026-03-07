@@ -33,11 +33,16 @@ func NewRouter(snapshot func() *runtime.Snapshot, cachePath string) (*Router, er
 	if err != nil {
 		return nil, err
 	}
+	fetcher, err := newUpstreamFetcher(cachePath)
+	if err != nil {
+		_ = store.Close()
+		return nil, err
+	}
 
 	return &Router{
 		engine:   cache.NewEngine(store),
 		store:    store,
-		fetcher:  newUpstreamFetcher(cachePath),
+		fetcher:  fetcher,
 		snapshot: snapshot,
 	}, nil
 }

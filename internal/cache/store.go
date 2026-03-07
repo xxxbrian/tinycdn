@@ -50,7 +50,12 @@ func NewBadgerStore(path string) (*BadgerStore, error) {
 		return nil, err
 	}
 
-	return &BadgerStore{db: db, blobDir: filepath.Join(path, "blobs")}, nil
+	store := &BadgerStore{db: db, blobDir: filepath.Join(path, "blobs")}
+	if err := store.pruneOrphanBodies(context.Background()); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	return store, nil
 }
 
 func (s *BadgerStore) GetEntry(ctx context.Context, key string) (Entry, bool, error) {
@@ -90,12 +95,17 @@ func (s *BadgerStore) PutEntry(ctx context.Context, key string, entry Entry) err
 		return err
 	}
 
+	existing, found, err := s.GetEntry(ctx, key)
+	if err != nil {
+		return err
+	}
+
 	payload, err := encodeEntry(entry)
 	if err != nil {
 		return err
 	}
 
-	return s.db.Update(func(txn *badger.Txn) error {
+	if err := s.db.Update(func(txn *badger.Txn) error {
 		e := badger.NewEntry([]byte(key), payload)
 		if !entry.InvalidAt.IsZero() {
 			ttl := time.Until(entry.InvalidAt)
@@ -105,7 +115,16 @@ func (s *BadgerStore) PutEntry(ctx context.Context, key string, entry Entry) err
 			e = e.WithTTL(ttl)
 		}
 		return txn.SetEntry(e)
-	})
+	}); err != nil {
+		return err
+	}
+
+	if found && existing.Response.BodyPath != "" && existing.Response.BodyPath != entry.Response.BodyPath {
+		if err := removeBodyPath(existing.Response.BodyPath); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *BadgerStore) GetVary(ctx context.Context, key string) (VarySpec, bool, error) {
@@ -259,6 +278,58 @@ func (s *BadgerStore) DeletePrefix(ctx context.Context, prefix string) (int, err
 
 func (s *BadgerStore) Close() error {
 	return s.db.Close()
+}
+
+func (s *BadgerStore) pruneOrphanBodies(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	referenced := map[string]struct{}{}
+	err := s.db.View(func(txn *badger.Txn) error {
+		opts := badger.DefaultIteratorOptions
+		it := txn.NewIterator(opts)
+		defer it.Close()
+
+		for it.Seek([]byte("resp|")); it.ValidForPrefix([]byte("resp|")); it.Next() {
+			item := it.Item()
+			if err := item.Value(func(value []byte) error {
+				entry, err := decodeEntry(append([]byte(nil), value...))
+				if err != nil {
+					return err
+				}
+				if entry.Response.BodyPath != "" {
+					referenced[entry.Response.BodyPath] = struct{}{}
+				}
+				return nil
+			}); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+
+	if err := os.MkdirAll(s.blobDir, 0o755); err != nil {
+		return err
+	}
+	return filepath.WalkDir(s.blobDir, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		if _, ok := referenced[path]; ok {
+			return nil
+		}
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		return nil
+	})
 }
 
 func encodeEntry(entry Entry) ([]byte, error) {

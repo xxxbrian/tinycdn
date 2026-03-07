@@ -42,6 +42,9 @@ func (s *memoryStore) GetEntry(_ context.Context, key string) (Entry, bool, erro
 func (s *memoryStore) PutEntry(_ context.Context, key string, entry Entry) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if existing, ok := s.entries[key]; ok && existing.Response.BodyPath != "" && existing.Response.BodyPath != entry.Response.BodyPath {
+		_ = os.Remove(existing.Response.BodyPath)
+	}
 	s.entries[key] = entry
 	return nil
 }

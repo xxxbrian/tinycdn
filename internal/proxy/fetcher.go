@@ -33,7 +33,12 @@ type upstreamFetcher struct {
 	tempDir                 string
 }
 
-func newUpstreamFetcher(cachePath string) *upstreamFetcher {
+func newUpstreamFetcher(cachePath string) (*upstreamFetcher, error) {
+	tempDir := filepath.Join(cachePath, "tmp")
+	if err := cleanupDirectoryFiles(tempDir); err != nil {
+		return nil, err
+	}
+
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	return &upstreamFetcher{
 		client: &http.Client{
@@ -41,8 +46,8 @@ func newUpstreamFetcher(cachePath string) *upstreamFetcher {
 			Timeout:   defaultUpstreamTimeout,
 		},
 		maxCacheableObjectBytes: defaultMaxCacheableObjectSize,
-		tempDir:                 filepath.Join(cachePath, "tmp"),
-	}
+		tempDir:                 tempDir,
+	}, nil
 }
 
 func (f *upstreamFetcher) Fetch(ctx context.Context, req *http.Request, site *runtime.CompiledSite) (cache.StoredResponse, error) {
@@ -139,6 +144,30 @@ func contentLength(resp *http.Response, copied int64) int64 {
 		return resp.ContentLength
 	}
 	return copied
+}
+
+func cleanupDirectoryFiles(dir string) error {
+	entries, err := os.ReadDir(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+
+	for _, entry := range entries {
+		path := filepath.Join(dir, entry.Name())
+		if entry.IsDir() {
+			if err := os.RemoveAll(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+			continue
+		}
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	return nil
 }
 
 func applyForwardedHeaders(upstreamReq *http.Request, req *http.Request) {
