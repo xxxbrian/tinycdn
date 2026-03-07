@@ -18,6 +18,12 @@ type memoryStore struct {
 	varies  map[string]VarySpec
 }
 
+type errorStore struct {
+	getEntryErr error
+	getVaryErr  error
+	putErr      error
+}
+
 func newMemoryStore() *memoryStore {
 	return &memoryStore{
 		entries: map[string]Entry{},
@@ -81,6 +87,34 @@ func (s *memoryStore) DeletePrefix(_ context.Context, prefix string) (int, error
 }
 
 func (s *memoryStore) Close() error {
+	return nil
+}
+
+func (s *errorStore) GetEntry(_ context.Context, _ string) (Entry, bool, error) {
+	return Entry{}, false, s.getEntryErr
+}
+
+func (s *errorStore) PutEntry(_ context.Context, _ string, _ Entry) error {
+	return s.putErr
+}
+
+func (s *errorStore) GetVary(_ context.Context, _ string) (VarySpec, bool, error) {
+	return VarySpec{}, false, s.getVaryErr
+}
+
+func (s *errorStore) PutVary(_ context.Context, _ string, _ VarySpec) error {
+	return s.putErr
+}
+
+func (s *errorStore) Delete(_ context.Context, _ string) error {
+	return nil
+}
+
+func (s *errorStore) DeletePrefix(_ context.Context, _ string) (int, error) {
+	return 0, nil
+}
+
+func (s *errorStore) Close() error {
 	return nil
 }
 
@@ -604,12 +638,47 @@ func TestEngineFollowOriginRequestAndResponseMatrix(t *testing.T) {
 			wantFetches: 2,
 		},
 		{
-			name:           "client no-cache forces revalidation in follow-origin",
+			name:           "client no-cache is ignored by edge cache",
 			header:         http.Header{"Cache-Control": {"public, max-age=30"}},
 			wantStored:     true,
-			wantSecond:     StateMiss,
-			wantFetches:    2,
+			wantSecond:     StateHit,
+			wantFetches:    1,
 			requestNoCache: true,
+		},
+		{
+			name:        "response no-cache is not stored",
+			header:      http.Header{"Cache-Control": {"public, no-cache"}},
+			wantStored:  false,
+			wantSecond:  StateMiss,
+			wantFetches: 2,
+		},
+		{
+			name:        "partial content is not stored",
+			header:      http.Header{"Cache-Control": {"public, max-age=30"}},
+			wantStored:  false,
+			wantSecond:  StateMiss,
+			wantFetches: 2,
+		},
+		{
+			name:        "content-range response is not stored",
+			header:      http.Header{"Cache-Control": {"public, max-age=30"}, "Content-Range": {"bytes 0-9/100"}},
+			wantStored:  false,
+			wantSecond:  StateMiss,
+			wantFetches: 2,
+		},
+		{
+			name:        "multi header cache-control is parsed",
+			header:      http.Header{"Cache-Control": {"public", "s-maxage=30"}},
+			wantStored:  true,
+			wantSecond:  StateHit,
+			wantFetches: 1,
+		},
+		{
+			name:        "multi header cache-control no-store wins",
+			header:      http.Header{"Cache-Control": {"public, max-age=30", "no-store"}},
+			wantStored:  false,
+			wantSecond:  StateMiss,
+			wantFetches: 2,
 		},
 	}
 
@@ -633,8 +702,11 @@ func TestEngineFollowOriginRequestAndResponseMatrix(t *testing.T) {
 
 			fetches := 0
 			statusCode := http.StatusOK
-			if tt.name == "uncacheable status does not cache" {
+			switch tt.name {
+			case "uncacheable status does not cache":
 				statusCode = http.StatusCreated
+			case "partial content is not stored":
+				statusCode = http.StatusPartialContent
 			}
 			fetch := func(_ context.Context, req *http.Request) (StoredResponse, error) {
 				fetches++
@@ -783,5 +855,62 @@ func TestBadgerCacheHelpers(t *testing.T) {
 	expected := []string{"Accept-Encoding", "Accept-Language", "Origin"}
 	if strings.Join(headers, ",") != strings.Join(expected, ",") {
 		t.Fatalf("unexpected vary headers: %#v", headers)
+	}
+}
+
+func TestEngineStoreErrorsDoNotPretendStored(t *testing.T) {
+	engine := NewEngine(&errorStore{putErr: context.DeadlineExceeded})
+	policy := Policy{
+		SiteID:    "site-1",
+		RuleID:    "rule-1",
+		PolicyTag: "rule-1|force",
+		Mode:      model.CacheModeForceCache,
+		TTL:       time.Minute,
+		HasTTL:    true,
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "https://cdn.example.com/assets/app.js", nil)
+	result, err := engine.Handle(context.Background(), req, policy, func(_ context.Context, req *http.Request) (StoredResponse, error) {
+		return StoredResponse{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": {"text/plain"}},
+			Body:       []byte("body"),
+		}, nil
+	})
+	if err != nil {
+		t.Fatalf("handle with store error: %v", err)
+	}
+	if strings.Contains(result.CacheStatus, "stored") {
+		t.Fatalf("did not expect stored cache status on store error: %q", result.CacheStatus)
+	}
+	if !strings.Contains(result.CacheStatus, "STORE_ERROR") {
+		t.Fatalf("expected STORE_ERROR detail, got %q", result.CacheStatus)
+	}
+}
+
+func TestEngineLookupErrorsSurfaceInCacheStatus(t *testing.T) {
+	engine := NewEngine(&errorStore{getVaryErr: context.DeadlineExceeded})
+	policy := Policy{
+		SiteID:    "site-1",
+		RuleID:    "rule-1",
+		PolicyTag: "rule-1|force",
+		Mode:      model.CacheModeForceCache,
+		TTL:       time.Minute,
+		HasTTL:    true,
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "https://cdn.example.com/assets/app.js", nil)
+	result, err := engine.Handle(context.Background(), req, policy, func(_ context.Context, req *http.Request) (StoredResponse, error) {
+		return StoredResponse{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": {"text/plain"}},
+			Body:       []byte("body"),
+		}, nil
+	})
+	if err != nil {
+		t.Fatalf("handle with lookup error: %v", err)
+	}
+	if !strings.Contains(result.CacheStatus, "STORE_READ_ERROR") {
+		t.Fatalf("expected STORE_READ_ERROR detail, got %q", result.CacheStatus)
 	}
 }

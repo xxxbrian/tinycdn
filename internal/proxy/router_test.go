@@ -97,6 +97,38 @@ func TestRouterBypassesRangeRequests(t *testing.T) {
 	}
 }
 
+func TestRouterStripsHopByHopResponseHeaders(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		rw.Header().Set("Connection", "keep-alive, X-Debug")
+		rw.Header().Set("Keep-Alive", "timeout=5")
+		rw.Header().Set("X-Debug", "upstream-secret")
+		rw.Header().Set("Content-Type", "text/plain")
+		rw.WriteHeader(http.StatusOK)
+		_, _ = rw.Write([]byte("payload"))
+	}))
+	defer upstream.Close()
+
+	router := newTestRouter(t, newTestSnapshot(t, upstream.URL))
+	defer router.Close()
+
+	req := httptest.NewRequest(http.MethodGet, "http://cdn.example.com/assets/app.js", nil)
+	req.Host = "cdn.example.com"
+
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, req)
+	response := recorder.Result()
+
+	if got := response.Header.Get("Connection"); got != "" {
+		t.Fatalf("expected Connection to be stripped, got %q", got)
+	}
+	if got := response.Header.Get("Keep-Alive"); got != "" {
+		t.Fatalf("expected Keep-Alive to be stripped, got %q", got)
+	}
+	if got := response.Header.Get("X-Debug"); got != "" {
+		t.Fatalf("expected Connection-token header to be stripped, got %q", got)
+	}
+}
+
 func newTestRouter(t *testing.T, snapshot *runtime.Snapshot) *Router {
 	t.Helper()
 	router, err := NewRouter(func() *runtime.Snapshot { return snapshot }, filepath.Join(t.TempDir(), "badger"))

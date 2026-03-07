@@ -7,6 +7,7 @@ import (
 	"net/url"
 
 	"tinycdn/internal/cache"
+	"tinycdn/internal/httpx"
 	"tinycdn/internal/model"
 	"tinycdn/internal/runtime"
 )
@@ -60,6 +61,7 @@ func buildUpstreamRequest(ctx context.Context, req *http.Request, site *runtime.
 	}
 
 	upstreamReq.Header = req.Header.Clone()
+	httpx.StripHopByHopHeaders(upstreamReq.Header)
 	upstreamReq.ContentLength = req.ContentLength
 	upstreamReq.TransferEncoding = append([]string(nil), req.TransferEncoding...)
 	upstreamReq.Trailer = req.Trailer.Clone()

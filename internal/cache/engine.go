@@ -13,6 +13,7 @@ import (
 
 	"golang.org/x/sync/singleflight"
 
+	"tinycdn/internal/httpx"
 	"tinycdn/internal/model"
 )
 
@@ -117,7 +118,7 @@ func (e *Engine) Handle(ctx context.Context, req *http.Request, policy Policy, f
 
 	keyMethod := cacheKeyMethod(req.Method)
 	baseKey := buildBaseCacheKey(policy.SiteID, keyMethod, req.URL.Path, req.URL.RawQuery)
-	cacheKey, entry, found := e.lookupEntry(ctx, baseKey, preparedReq.Header)
+	cacheKey, entry, found, lookupErr := e.lookupEntry(ctx, baseKey, preparedReq.Header)
 	now := e.now()
 
 	if found && entry.PolicyTag == policy.PolicyTag {
@@ -143,11 +144,16 @@ func (e *Engine) Handle(ctx context.Context, req *http.Request, policy Policy, f
 	if decision.Store && shouldStoreResponse(req.Method) {
 		cacheKey = buildStorageKey(baseKey, decision.VaryHeaders, preparedReq.Header)
 		entry := buildEntry(now, cacheKey, policy, decision, response)
-		_ = e.storeResponse(ctx, baseKey, entry, decision.VaryHeaders)
-		return buildResult(StateMiss, response, missCacheStatus(cacheKey, true)), nil
+		if err := e.storeResponse(ctx, baseKey, entry, decision.VaryHeaders); err != nil {
+			return buildResult(StateMiss, response, missCacheStatus(cacheKey, false, combineStatusDetails(lookupErr, "STORE_ERROR"))), nil
+		}
+		return buildResult(StateMiss, response, missCacheStatus(cacheKey, true, combineStatusDetails(lookupErr))), nil
 	}
 
-	return buildResult(StateMiss, response, missCacheStatus(cacheKey, false)), nil
+	if lookupErr != nil {
+		return buildResult(StateMiss, response, missCacheStatus(cacheKey, false, combineStatusDetails(lookupErr))), nil
+	}
+	return buildResult(StateMiss, response, missCacheStatus(cacheKey, false, "")), nil
 }
 
 func (e *Engine) refreshInBackground(ctx context.Context, cacheKey string, req *http.Request, policy Policy, fetch FetchFunc) {
@@ -209,19 +215,22 @@ func (e *Engine) PurgeURL(ctx context.Context, siteID, path, rawQuery string) (i
 	return deleted + variantDeleted, nil
 }
 
-func (e *Engine) lookupEntry(ctx context.Context, baseKey string, requestHeader http.Header) (string, Entry, bool) {
+func (e *Engine) lookupEntry(ctx context.Context, baseKey string, requestHeader http.Header) (string, Entry, bool, error) {
 	cacheKey := responseKey(baseKey)
 
 	spec, found, err := e.store.GetVary(ctx, varyKey(baseKey))
-	if err == nil && found && len(spec.Headers) > 0 {
+	if err != nil {
+		return cacheKey, Entry{}, false, err
+	}
+	if found && len(spec.Headers) > 0 {
 		cacheKey = buildVariantKey(baseKey, spec.Headers, requestHeader)
 	}
 
 	entry, found, err := e.store.GetEntry(ctx, cacheKey)
 	if err != nil {
-		return cacheKey, Entry{}, false
+		return cacheKey, Entry{}, false, err
 	}
-	return cacheKey, entry, found
+	return cacheKey, entry, found, nil
 }
 
 func (e *Engine) storeResponse(ctx context.Context, baseKey string, entry Entry, varyHeaders []string) error {
@@ -282,7 +291,7 @@ type storeDecision struct {
 }
 
 func decideStore(now time.Time, policy Policy, response StoredResponse) storeDecision {
-	if !isCacheableStatus(response.StatusCode) {
+	if !isCacheableStatus(response.StatusCode) || response.Header.Get("Content-Range") != "" {
 		return storeDecision{}
 	}
 
@@ -290,8 +299,8 @@ func decideStore(now time.Time, policy Policy, response StoredResponse) storeDec
 	case model.CacheModeBypass:
 		return storeDecision{}
 	case model.CacheModeFollowOrigin:
-		directives := parseCacheControl(response.Header.Get("Cache-Control"))
-		if directives.noStore || directives.isPrivate {
+		directives := parseCacheControl(httpx.CombinedHeaderValue(response.Header, "Cache-Control"))
+		if directives.noStore || directives.isPrivate || directives.noCache {
 			return storeDecision{}
 		}
 
@@ -398,26 +407,19 @@ func prepareRequest(req *http.Request, policy Policy) (*http.Request, State) {
 		return cloned, StateBypass
 	}
 
-	if policy.IgnoreClientControl {
-		cloned.Header.Del("Cache-Control")
-		cloned.Header.Del("Pragma")
-		for _, headerName := range conditionalRequestHeaders {
-			cloned.Header.Del(headerName)
-		}
+	cloned.Header.Del("Cache-Control")
+	cloned.Header.Del("Pragma")
+	for _, headerName := range conditionalRequestHeaders {
+		cloned.Header.Del(headerName)
 	}
 
 	return cloned, StateMiss
 }
 
 func shouldForceRefresh(req *http.Request, policy Policy) bool {
-	if policy.IgnoreClientControl {
-		return false
-	}
-
-	cacheControl := strings.ToLower(req.Header.Get("Cache-Control"))
-	return strings.Contains(cacheControl, "no-cache") ||
-		strings.Contains(cacheControl, "max-age=0") ||
-		strings.EqualFold(req.Header.Get("Pragma"), "no-cache")
+	_ = req
+	_ = policy
+	return false
 }
 
 func shouldStoreResponse(method string) bool {
@@ -486,9 +488,7 @@ func buildVariantFingerprint(varyHeaders []string, requestHeader http.Header) st
 
 func sanitizeStoredHeader(header http.Header) http.Header {
 	cloned := header.Clone()
-	for _, hopByHop := range hopByHopHeaders {
-		cloned.Del(hopByHop)
-	}
+	httpx.StripHopByHopHeaders(cloned)
 	cloned.Del("Content-Length")
 	return cloned
 }
@@ -501,23 +501,11 @@ var conditionalRequestHeaders = []string{
 	"If-Unmodified-Since",
 }
 
-var hopByHopHeaders = []string{
-	"Connection",
-	"Keep-Alive",
-	"Proxy-Authenticate",
-	"Proxy-Authorization",
-	"Te",
-	"Trailer",
-	"Transfer-Encoding",
-	"Upgrade",
-}
-
 func isCacheableStatus(statusCode int) bool {
 	switch statusCode {
 	case http.StatusOK,
 		http.StatusNonAuthoritativeInfo,
 		http.StatusNoContent,
-		http.StatusPartialContent,
 		http.StatusMultipleChoices,
 		http.StatusMovedPermanently,
 		http.StatusNotFound,
@@ -535,12 +523,28 @@ func bypassCacheStatus(detail string) string {
 	return "TinyCDN; fwd=bypass; detail=" + detail
 }
 
-func missCacheStatus(key string, stored bool) string {
+func missCacheStatus(key string, stored bool, detail string) string {
 	status := "TinyCDN; fwd=uri-miss; key=" + key
+	if detail != "" {
+		status += "; detail=" + detail
+	}
 	if stored {
 		return status + "; stored"
 	}
 	return status
+}
+
+func combineStatusDetails(lookupErr error, extra ...string) string {
+	details := make([]string, 0, len(extra)+1)
+	if lookupErr != nil {
+		details = append(details, "STORE_READ_ERROR")
+	}
+	for _, value := range extra {
+		if value != "" {
+			details = append(details, value)
+		}
+	}
+	return strings.Join(details, ",")
 }
 
 func hitCacheStatus(entry Entry, state State, now time.Time) string {
