@@ -60,7 +60,7 @@ function SiteRulesPage() {
       <PageHeader
         eyebrow="Site workspace"
         title="Rules"
-        description="Rules are evaluated in order. Cache mode, TTL, and stale-if-error stay at rule level, while optimistic refresh stays at the site level."
+        description="Rules are evaluated in order. Cache mode, TTL, stale-if-error, and optimistic refresh all live at the rule level."
         badge={`${site.rules.length} total`}
       />
       <div className="px-4 pb-4 lg:px-6 lg:pb-6">

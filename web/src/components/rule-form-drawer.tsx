@@ -441,8 +441,8 @@ export function RuleFormDrawer({
             <div className="grid gap-1">
               <h3 className="font-semibold">Cache behavior</h3>
               <p className="text-sm text-muted-foreground">
-                Configure how TinyCDN handles matched responses. Optimistic refresh remains
-                site-level.
+                Configure how TinyCDN caches matching responses. Normal and optimistic behavior now
+                live directly on the rule.
               </p>
             </div>
             <div className="grid gap-4 lg:grid-cols-2">
@@ -460,6 +460,7 @@ export function RuleFormDrawer({
                         value === "force_cache" || value === "override_origin"
                           ? current.staleIfError
                           : "",
+                      optimistic: value === "bypass" ? false : current.optimistic,
                     }))
                   }
                 >
@@ -501,13 +502,53 @@ export function RuleFormDrawer({
                       placeholder="10m"
                     />
                   </div>
+                  <label className="flex items-start justify-between gap-4 rounded-lg border p-3 text-sm lg:col-span-2">
+                    <div>
+                      <p className="font-medium">Optimistic refresh</p>
+                      <p className="text-muted-foreground">
+                        Serve stale cache on expiry and refresh it in the background.
+                      </p>
+                    </div>
+                    <Switch
+                      checked={state.optimistic}
+                      onCheckedChange={(checked) =>
+                        setState((current) => ({
+                          ...current,
+                          optimistic: checked,
+                        }))
+                      }
+                      aria-label="Optimistic refresh"
+                    />
+                  </label>
                 </>
               ) : (
-                <div className="rounded-lg border border-dashed bg-muted/30 px-4 py-3 text-sm text-muted-foreground lg:col-span-2">
-                  {state.cacheMode === "follow_origin"
-                    ? "Origin cache headers control freshness in follow-origin mode, so rule-level TTL and stale-if-error do not apply here."
-                    : "Bypass mode skips edge caching entirely, so TTL and stale-if-error do not apply here."}
-                </div>
+                <>
+                  <div className="rounded-lg border border-dashed bg-muted/30 px-4 py-3 text-sm text-muted-foreground lg:col-span-2">
+                    {state.cacheMode === "follow_origin"
+                      ? "Origin cache headers control freshness in follow-origin mode, while optimistic refresh can still tell TinyCDN to serve stale cache during background refresh."
+                      : "Bypass mode skips edge caching entirely, so TTL, stale-if-error, and optimistic refresh do not apply here."}
+                  </div>
+                  {state.cacheMode === "follow_origin" ? (
+                    <label className="flex items-start justify-between gap-4 rounded-lg border p-3 text-sm lg:col-span-2">
+                      <div>
+                        <p className="font-medium">Optimistic refresh</p>
+                        <p className="text-muted-foreground">
+                          Serve stale cache on expiry and refresh it in the background.
+                        </p>
+                      </div>
+                      <Switch
+                        checked={state.optimistic}
+                        onCheckedChange={(checked) =>
+                          setState((current) => ({
+                            ...current,
+                            optimistic: checked,
+                          }))
+                        }
+                        aria-label="Optimistic refresh"
+                      />
+                    </label>
+                  ) : null}
+                </>
               )}
             </div>
             {hasNonSafeMethods ? (
@@ -522,9 +563,7 @@ export function RuleFormDrawer({
 
         <DrawerFooter className="border-t">
           <div className="flex w-full items-center justify-between gap-3">
-            <p className="text-sm text-muted-foreground">
-              Optimistic refresh is configured at the site level.
-            </p>
+            <p className="text-sm text-muted-foreground">Rules evaluate in order, top to bottom.</p>
             <div className="flex items-center gap-2">
               <Button variant="outline" onClick={() => onOpenChange(false)}>
                 Cancel

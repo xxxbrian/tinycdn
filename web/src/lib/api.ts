@@ -77,7 +77,6 @@ export function toSiteInput(site: Site, overrides: Partial<SiteInput> = {}): Sit
     id: site.id,
     name: site.name,
     enabled: site.enabled,
-    optimistic_refresh: site.cache.optimistic_refresh,
     hosts: [...site.hosts],
     upstream_url: site.upstream.url,
     upstream_host_mode: site.upstream.host_mode ?? "follow_origin",

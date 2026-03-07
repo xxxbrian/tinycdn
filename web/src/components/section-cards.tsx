@@ -23,7 +23,7 @@ export function SectionCards({
     activeSites: number;
     totalHosts: number;
     totalRules: number;
-    optimisticSites: number;
+    optimisticRules: number;
   };
 }) {
   return (
@@ -90,22 +90,24 @@ export function SectionCards({
       </Card>
       <Card className="@container/card">
         <CardHeader>
-          <CardDescription>Optimistic Refresh</CardDescription>
+          <CardDescription>Optimistic Rules</CardDescription>
           <CardTitle className="text-2xl font-semibold tabular-nums @[250px]/card:text-3xl">
-            {stats.optimisticSites}
+            {stats.optimisticRules}
           </CardTitle>
           <CardAction>
             <Badge variant="outline">
               <IconRefresh />
-              site-level
+              rule-level
             </Badge>
           </CardAction>
         </CardHeader>
         <CardFooter className="flex-col items-start gap-1.5 text-sm">
           <div className="line-clamp-1 flex gap-2 font-medium">
-            Stale refresh stays coarse on purpose <IconArrowUpRight className="size-4" />
+            Stale refresh now follows explicit rule policy <IconArrowUpRight className="size-4" />
           </div>
-          <div className="text-muted-foreground">Rule-level SWR was removed from the MVP model</div>
+          <div className="text-muted-foreground">
+            Normal and optimistic cache behavior share the same rule engine
+          </div>
         </CardFooter>
       </Card>
     </div>

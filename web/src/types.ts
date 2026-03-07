@@ -34,6 +34,7 @@ export interface CacheAction {
   mode: CacheMode;
   ttl?: string;
   stale_if_error?: string;
+  optimistic?: boolean;
 }
 
 export interface Rule {
@@ -51,9 +52,6 @@ export interface Site {
   id: string;
   name: string;
   enabled: boolean;
-  cache: {
-    optimistic_refresh: boolean;
-  };
   hosts: string[];
   upstream: {
     url: string;
@@ -67,7 +65,6 @@ export interface SiteInput {
   id?: string;
   name: string;
   enabled: boolean;
-  optimistic_refresh: boolean;
   hosts: string[];
   upstream_url: string;
   upstream_host_mode: UpstreamHostMode;

@@ -16,6 +16,7 @@ export interface RuleFormState {
   cacheMode: Rule["action"]["cache"]["mode"];
   ttl: string;
   staleIfError: string;
+  optimistic: boolean;
 }
 
 export const fieldOptions: Array<{ value: MatchField; label: string }> = [
@@ -141,6 +142,7 @@ export function ruleToFormState(rule: Rule): RuleFormState {
     cacheMode: rule.action.cache.mode,
     ttl: rule.action.cache.ttl ?? "",
     staleIfError: rule.action.cache.stale_if_error ?? "",
+    optimistic: rule.action.cache.optimistic ?? false,
   };
 }
 
@@ -159,6 +161,7 @@ export function formStateToRule(rule: Rule, state: RuleFormState): Rule {
         mode: state.cacheMode,
         ttl: state.ttl || undefined,
         stale_if_error: state.staleIfError || undefined,
+        optimistic: state.cacheMode === "bypass" ? undefined : state.optimistic || undefined,
       },
     },
   };
@@ -213,6 +216,9 @@ export function describeRuleCache(rule: Rule) {
   }
   if (supportsCacheTiming(rule.action.cache.mode) && rule.action.cache.stale_if_error) {
     bits.push(`Stale-if-error ${rule.action.cache.stale_if_error}`);
+  }
+  if (rule.action.cache.mode !== "bypass" && rule.action.cache.optimistic) {
+    bits.push("Optimistic");
   }
   return bits.join(" • ");
 }

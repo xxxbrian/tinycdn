@@ -4,14 +4,17 @@ export function getGlobalStats(sites: Site[]) {
   const totalHosts = sites.reduce((sum, site) => sum + site.hosts.length, 0);
   const totalRules = sites.reduce((sum, site) => sum + site.rules.length, 0);
   const activeSites = sites.filter((site) => site.enabled).length;
-  const optimisticSites = sites.filter((site) => site.cache.optimistic_refresh).length;
+  const optimisticRules = sites.reduce(
+    (sum, site) => sum + site.rules.filter((rule) => rule.action.cache.optimistic).length,
+    0,
+  );
 
   return {
     totalSites: sites.length,
     activeSites,
     totalHosts,
     totalRules,
-    optimisticSites,
+    optimisticRules,
   };
 }
 
@@ -24,7 +27,7 @@ export function getSiteStats(site: Site) {
     totalRules: site.rules.length,
     customRuleCount: customRules.length,
     enabledRules,
-    optimisticRefresh: site.cache.optimistic_refresh,
+    optimisticRuleCount: customRules.filter((rule) => rule.action.cache.optimistic).length,
     defaultRule: site.rules[site.rules.length - 1] ?? null,
   };
 }

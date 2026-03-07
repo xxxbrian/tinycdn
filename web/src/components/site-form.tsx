@@ -148,25 +148,6 @@ export function SiteForm({
         />
       </label>
 
-      <label className="flex items-start justify-between gap-4 rounded-lg border p-3 text-sm">
-        <div>
-          <p className="font-medium">Optimistic refresh</p>
-          <p className="text-muted-foreground">
-            Serve stale edge cache on expiry and refresh in the background.
-          </p>
-        </div>
-        <Switch
-          checked={form.optimistic_refresh}
-          onCheckedChange={(checked) =>
-            setForm((current) => ({
-              ...current,
-              optimistic_refresh: checked,
-            }))
-          }
-          aria-label="Optimistic refresh"
-        />
-      </label>
-
       <div className="flex justify-end">
         <Button type="submit" disabled={saving}>
           {submitLabel}

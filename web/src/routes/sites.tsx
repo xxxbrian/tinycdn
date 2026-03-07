@@ -86,7 +86,6 @@ function SitesPage() {
                   initialValue={{
                     name: "",
                     enabled: true,
-                    optimistic_refresh: false,
                     hosts: [],
                     upstream_url: "",
                     upstream_host_mode: "follow_origin",
@@ -143,7 +142,6 @@ function SitesPage() {
                   <TableHead>Status</TableHead>
                   <TableHead>Hosts</TableHead>
                   <TableHead>Rules</TableHead>
-                  <TableHead>Cache</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -168,11 +166,6 @@ function SitesPage() {
                     </TableCell>
                     <TableCell>{site.hosts.length}</TableCell>
                     <TableCell>{site.rules.length}</TableCell>
-                    <TableCell>
-                      <Badge variant={site.cache.optimistic_refresh ? "outline" : "secondary"}>
-                        {site.cache.optimistic_refresh ? "Optimistic" : "Normal"}
-                      </Badge>
-                    </TableCell>
                   </TableRow>
                 ))}
               </TableBody>

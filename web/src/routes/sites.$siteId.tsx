@@ -154,14 +154,14 @@ function SiteOverviewPage() {
           <CardHeader>
             <CardTitle>Cache posture</CardTitle>
             <CardDescription>
-              Site-level defaults that shape how the rule pipeline behaves.
+              Cache behavior now lives at the rule layer, including optimistic refresh.
             </CardDescription>
           </CardHeader>
           <CardContent className="grid gap-3 text-sm">
             <div className="flex items-center justify-between rounded-lg border p-3">
-              <span className="text-muted-foreground">Optimistic refresh</span>
-              <Badge variant={site.cache.optimistic_refresh ? "outline" : "secondary"}>
-                {site.cache.optimistic_refresh ? "Enabled" : "Off"}
+              <span className="text-muted-foreground">Optimistic rules</span>
+              <Badge variant={stats.optimisticRuleCount > 0 ? "outline" : "secondary"}>
+                {stats.optimisticRuleCount}
               </Badge>
             </div>
             <div className="flex items-center justify-between rounded-lg border p-3">
