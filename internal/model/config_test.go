@@ -65,6 +65,36 @@ func TestValidateSiteUpstreamHostMode(t *testing.T) {
 			t.Fatalf("expected follow_request to reject explicit host, got %v", err)
 		}
 	})
+
+	t.Run("rejects upstream path prefix", func(t *testing.T) {
+		site := base
+		site.Upstream.URL = "https://origin.example.com/base"
+
+		err := validateSite(site)
+		if err == nil || !strings.Contains(err.Error(), "path prefix") {
+			t.Fatalf("expected upstream path prefix to be rejected, got %v", err)
+		}
+	})
+
+	t.Run("rejects upstream query", func(t *testing.T) {
+		site := base
+		site.Upstream.URL = "https://origin.example.com?preview=1"
+
+		err := validateSite(site)
+		if err == nil || !strings.Contains(err.Error(), "query parameters") {
+			t.Fatalf("expected upstream query to be rejected, got %v", err)
+		}
+	})
+
+	t.Run("rejects upstream fragment", func(t *testing.T) {
+		site := base
+		site.Upstream.URL = "https://origin.example.com#frag"
+
+		err := validateSite(site)
+		if err == nil || !strings.Contains(err.Error(), "fragment") {
+			t.Fatalf("expected upstream fragment to be rejected, got %v", err)
+		}
+	})
 }
 
 func TestValidateRuleOptimisticMode(t *testing.T) {

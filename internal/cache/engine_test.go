@@ -443,6 +443,58 @@ func TestEngineVarySeparatesVariants(t *testing.T) {
 	}
 }
 
+func TestEngineVaryNormalizesAcceptEncodingFormatting(t *testing.T) {
+	store := newMemoryStore()
+	engine := NewEngine(store)
+	now := time.Date(2026, time.March, 7, 0, 0, 0, 0, time.UTC)
+	engine.now = func() time.Time { return now }
+
+	policy := Policy{
+		SiteID:    "site-1",
+		RuleID:    "rule-1",
+		PolicyTag: "rule-1|origin",
+		Mode:      model.CacheModeFollowOrigin,
+	}
+
+	fetches := 0
+	fetch := func(_ context.Context, req *http.Request) (StoredResponse, error) {
+		fetches++
+		return StoredResponse{
+			StatusCode: http.StatusOK,
+			Header: http.Header{
+				"Cache-Control":    {"public, max-age=60"},
+				"Vary":             {"Accept-Encoding"},
+				"Content-Type":     {"text/plain"},
+				"Content-Encoding": {"gzip"},
+			},
+			Body: []byte("gzip"),
+		}, nil
+	}
+
+	firstReq := httptest.NewRequest(http.MethodGet, "https://cdn.example.com/assets/app.js", nil)
+	firstReq.Header.Set("Accept-Encoding", "gzip, br")
+	first, err := engine.Handle(context.Background(), firstReq, policy, fetch)
+	if err != nil {
+		t.Fatalf("prime variant: %v", err)
+	}
+	if first.State != StateMiss {
+		t.Fatalf("expected first variant request to miss, got %s", first.State)
+	}
+
+	secondReq := httptest.NewRequest(http.MethodGet, "https://cdn.example.com/assets/app.js", nil)
+	secondReq.Header.Set("Accept-Encoding", "gzip,br")
+	second, err := engine.Handle(context.Background(), secondReq, policy, fetch)
+	if err != nil {
+		t.Fatalf("normalized variant hit: %v", err)
+	}
+	if second.State != StateHit {
+		t.Fatalf("expected normalized Accept-Encoding request to hit, got %s", second.State)
+	}
+	if fetches != 1 {
+		t.Fatalf("expected one upstream fetch for equivalent Accept-Encoding variants, got %d", fetches)
+	}
+}
+
 func TestEnginePurgeURLClearsAllVariants(t *testing.T) {
 	store := newMemoryStore()
 	engine := NewEngine(store)
@@ -1084,6 +1136,13 @@ func TestBadgerCacheHelpers(t *testing.T) {
 	expected := []string{"Accept-Encoding", "Accept-Language", "Origin"}
 	if strings.Join(headers, ",") != strings.Join(expected, ",") {
 		t.Fatalf("unexpected vary headers: %#v", headers)
+	}
+
+	if normalized := normalizeVaryHeaderValue("Accept-Encoding", []string{"gzip, br", "deflate"}); normalized != "gzip,br,deflate" {
+		t.Fatalf("unexpected normalized accept-encoding %q", normalized)
+	}
+	if normalized := normalizeVaryHeaderValue("Accept-Language", []string{"en-US, zh-CN"}); normalized != "en-us,zh-cn" {
+		t.Fatalf("unexpected normalized accept-language %q", normalized)
 	}
 }
 

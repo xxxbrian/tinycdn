@@ -505,13 +505,48 @@ func buildVariantFingerprint(varyHeaders []string, requestHeader http.Header) st
 	parts := make([]string, 0, len(varyHeaders))
 	for _, headerName := range varyHeaders {
 		values := requestHeader.Values(headerName)
-		if len(values) == 0 {
+		normalized := normalizeVaryHeaderValue(headerName, values)
+		if normalized == "" {
 			parts = append(parts, headerName+"=")
 			continue
 		}
-		parts = append(parts, headerName+"="+strings.Join(values, ","))
+		parts = append(parts, headerName+"="+normalized)
 	}
 	return strings.Join(parts, "\n")
+}
+
+func normalizeVaryHeaderValue(headerName string, values []string) string {
+	switch http.CanonicalHeaderKey(headerName) {
+	case "Accept-Encoding", "Accept-Language":
+		return normalizeCommaSeparatedTokens(values, true)
+	default:
+		normalized := make([]string, 0, len(values))
+		for _, value := range values {
+			value = strings.TrimSpace(value)
+			if value == "" {
+				continue
+			}
+			normalized = append(normalized, value)
+		}
+		return strings.Join(normalized, ",")
+	}
+}
+
+func normalizeCommaSeparatedTokens(values []string, lower bool) string {
+	tokens := make([]string, 0, len(values))
+	for _, value := range values {
+		for _, part := range strings.Split(value, ",") {
+			token := strings.TrimSpace(part)
+			if token == "" {
+				continue
+			}
+			if lower {
+				token = strings.ToLower(token)
+			}
+			tokens = append(tokens, token)
+		}
+	}
+	return strings.Join(tokens, ",")
 }
 
 func sanitizeStoredHeader(header http.Header) http.Header {

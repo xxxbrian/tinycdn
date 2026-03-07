@@ -220,6 +220,15 @@ func validateSite(site Site) error {
 	if upstreamURL.Host == "" {
 		return fmt.Errorf("upstream url must include host, got %q", site.Upstream.URL)
 	}
+	if upstreamURL.Path != "" && upstreamURL.Path != "/" {
+		return fmt.Errorf("upstream url must not include a path prefix, got %q", site.Upstream.URL)
+	}
+	if upstreamURL.RawQuery != "" {
+		return fmt.Errorf("upstream url must not include query parameters, got %q", site.Upstream.URL)
+	}
+	if upstreamURL.Fragment != "" {
+		return fmt.Errorf("upstream url must not include a fragment, got %q", site.Upstream.URL)
+	}
 
 	hostMode := site.Upstream.HostMode
 	if hostMode == "" {
