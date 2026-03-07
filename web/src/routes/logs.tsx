@@ -73,62 +73,63 @@ function LogsPage() {
         description="Filter request records and review audit events without leaving the dashboard shell."
       />
 
-      <div className="grid gap-3 px-4 sm:grid-cols-2 xl:grid-cols-[minmax(0,1.35fr)_repeat(4,minmax(0,0.8fr))] lg:px-6">
+      <div className="grid gap-2 px-4 lg:px-6">
         <Input
-          className="sm:col-span-2 xl:col-span-1"
           value={search}
           onChange={(event) => setSearch(event.target.value)}
           placeholder="Search request ID, host, path, IP, or user agent"
         />
-        <Select value={period} onValueChange={(value) => setPeriod(value as AnalyticsPeriod)}>
-          <SelectTrigger>
-            <SelectValue placeholder="Period" />
-          </SelectTrigger>
-          <SelectContent>
-            {analyticsPeriods.map((item) => (
-              <SelectItem key={item.value} value={item.value}>
-                {item.label}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
-        <Select value={method} onValueChange={setMethod}>
-          <SelectTrigger>
-            <SelectValue placeholder="Method" />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value="all">All methods</SelectItem>
-            <SelectItem value="GET">GET</SelectItem>
-            <SelectItem value="HEAD">HEAD</SelectItem>
-            <SelectItem value="POST">POST</SelectItem>
-            <SelectItem value="PUT">PUT</SelectItem>
-          </SelectContent>
-        </Select>
-        <Select value={cacheState} onValueChange={setCacheState}>
-          <SelectTrigger>
-            <SelectValue placeholder="Cache state" />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value="all">All cache states</SelectItem>
-            <SelectItem value="HIT">HIT</SelectItem>
-            <SelectItem value="MISS">MISS</SelectItem>
-            <SelectItem value="STALE">STALE</SelectItem>
-            <SelectItem value="BYPASS">BYPASS</SelectItem>
-            <SelectItem value="ERROR">ERROR</SelectItem>
-          </SelectContent>
-        </Select>
-        <Select value={statusClass} onValueChange={setStatusClass}>
-          <SelectTrigger>
-            <SelectValue placeholder="Status" />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value="all">All statuses</SelectItem>
-            <SelectItem value="2xx">2xx</SelectItem>
-            <SelectItem value="3xx">3xx</SelectItem>
-            <SelectItem value="4xx">4xx</SelectItem>
-            <SelectItem value="5xx">5xx</SelectItem>
-          </SelectContent>
-        </Select>
+        <div className="flex flex-wrap gap-2">
+          <Select value={period} onValueChange={(value) => setPeriod(value as AnalyticsPeriod)}>
+            <SelectTrigger className="w-[152px]">
+              <SelectValue placeholder="Period" />
+            </SelectTrigger>
+            <SelectContent>
+              {analyticsPeriods.map((item) => (
+                <SelectItem key={item.value} value={item.value}>
+                  {item.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          <Select value={method} onValueChange={setMethod}>
+            <SelectTrigger className="w-[152px]">
+              <SelectValue placeholder="Method" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">All methods</SelectItem>
+              <SelectItem value="GET">GET</SelectItem>
+              <SelectItem value="HEAD">HEAD</SelectItem>
+              <SelectItem value="POST">POST</SelectItem>
+              <SelectItem value="PUT">PUT</SelectItem>
+            </SelectContent>
+          </Select>
+          <Select value={cacheState} onValueChange={setCacheState}>
+            <SelectTrigger className="w-[168px]">
+              <SelectValue placeholder="Cache state" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">All cache states</SelectItem>
+              <SelectItem value="HIT">HIT</SelectItem>
+              <SelectItem value="MISS">MISS</SelectItem>
+              <SelectItem value="STALE">STALE</SelectItem>
+              <SelectItem value="BYPASS">BYPASS</SelectItem>
+              <SelectItem value="ERROR">ERROR</SelectItem>
+            </SelectContent>
+          </Select>
+          <Select value={statusClass} onValueChange={setStatusClass}>
+            <SelectTrigger className="w-[152px]">
+              <SelectValue placeholder="Status" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">All statuses</SelectItem>
+              <SelectItem value="2xx">2xx</SelectItem>
+              <SelectItem value="3xx">3xx</SelectItem>
+              <SelectItem value="4xx">4xx</SelectItem>
+              <SelectItem value="5xx">5xx</SelectItem>
+            </SelectContent>
+          </Select>
+        </div>
       </div>
 
       <div className="grid gap-6 px-4 pb-6 2xl:grid-cols-[minmax(0,1.5fr)_20rem] lg:px-6">
