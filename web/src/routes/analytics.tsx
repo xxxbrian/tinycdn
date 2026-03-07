@@ -96,7 +96,7 @@ function AnalyticsPage() {
         <BreakdownCard
           title="Top sites"
           description="Which sites currently own the most demand."
-          items={report.top_sites.map((item) => ({
+          items={(report.top_sites ?? []).map((item) => ({
             key: item.site_id,
             label: item.site_name,
             requests: item.requests,
@@ -108,7 +108,7 @@ function AnalyticsPage() {
         <BreakdownCard
           title="Top paths"
           description="Busy content surfaces over the current period."
-          items={report.top_paths.map((item) => ({
+          items={(report.top_paths ?? []).map((item) => ({
             key: item.path,
             label: item.path,
             requests: item.requests,

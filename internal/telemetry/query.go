@@ -15,8 +15,16 @@ func (s *Service) Report(ctx context.Context, params ReportParams) (Report, erro
 	}
 	since := time.Now().Add(-period).Unix()
 	report := Report{
-		GeneratedAt: time.Now().UTC(),
-		Period:      period.String(),
+		GeneratedAt:   time.Now().UTC(),
+		Period:        period.String(),
+		Series:        []SeriesPoint{},
+		CacheStates:   []CountBreakdown{},
+		Methods:       []CountBreakdown{},
+		StatusClasses: []CountBreakdown{},
+		TopPaths:      []PathBreakdown{},
+		TopHosts:      []CountBreakdown{},
+		TopSites:      []SiteBreakdown{},
+		TopRules:      []CountBreakdown{},
 	}
 
 	filter := "bucket_unix >= ?"

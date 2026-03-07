@@ -96,7 +96,7 @@ function SiteAnalyticsPage() {
         <BreakdownCard
           title="Top paths"
           description="The most active content paths on this site."
-          items={report.top_paths.map((item) => ({
+          items={(report.top_paths ?? []).map((item) => ({
             key: item.path,
             label: item.path,
             requests: item.requests,
@@ -109,8 +109,8 @@ function SiteAnalyticsPage() {
           title="Top hosts and rules"
           description="Host bindings and rule pressure for this site."
           items={[
-            ...report.top_hosts,
-            ...report.top_rules.map((item) => ({
+            ...(report.top_hosts ?? []),
+            ...(report.top_rules ?? []).map((item) => ({
               ...item,
               key: `rule:${item.key}`,
               label: item.key,

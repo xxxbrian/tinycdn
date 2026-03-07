@@ -67,7 +67,7 @@ function OverviewPage() {
     };
   }, [period]);
 
-  const topSitesByID = new Map(report.top_sites.map((site) => [site.site_id, site]));
+  const topSitesByID = new Map((report.top_sites ?? []).map((site) => [site.site_id, site]));
 
   return (
     <ConsoleShell>
@@ -190,7 +190,7 @@ function OverviewPage() {
         <BreakdownCard
           title="Top paths"
           description="The busiest cached paths over the current period."
-          items={report.top_paths.map((item) => ({
+          items={(report.top_paths ?? []).map((item) => ({
             key: item.path,
             label: item.path,
             requests: item.requests,
