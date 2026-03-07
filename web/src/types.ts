@@ -74,3 +74,14 @@ export interface SiteInput {
 export interface ReorderPayload {
   rule_ids: string[];
 }
+
+export interface PurgeCachePayload {
+  all?: boolean;
+  urls?: string[];
+}
+
+export interface PurgeCacheResult {
+  purged: number;
+  scope: "site" | "url";
+  urls?: string[];
+}

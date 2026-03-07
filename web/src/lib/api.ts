@@ -1,4 +1,11 @@
-import type { ReorderPayload, Rule, Site, SiteInput } from "@/types";
+import type {
+  PurgeCachePayload,
+  PurgeCacheResult,
+  ReorderPayload,
+  Rule,
+  Site,
+  SiteInput,
+} from "@/types";
 
 async function request<T>(input: string, init?: RequestInit): Promise<T> {
   const response = await fetch(input, {
@@ -67,6 +74,11 @@ export const api = {
     }),
   reorderRules: (siteId: string, payload: ReorderPayload) =>
     request<Rule[]>(`/api/sites/${siteId}/rules/reorder`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  purgeCache: (siteId: string, payload: PurgeCachePayload) =>
+    request<PurgeCacheResult>(`/api/sites/${siteId}/cache/purge`, {
       method: "POST",
       body: JSON.stringify(payload),
     }),

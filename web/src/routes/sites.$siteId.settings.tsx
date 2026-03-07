@@ -26,7 +26,7 @@ function SiteSettingsPage() {
       <PageHeader
         eyebrow="Site workspace"
         title="Settings"
-        description="General site metadata, host bindings, and optimistic cache behavior live here."
+        description="General site metadata and host bindings live here, while cache behavior stays with rules."
       />
       <div className="grid gap-6 px-4 pb-4 lg:grid-cols-[1.2fr_0.8fr] lg:px-6 lg:pb-6">
         <Card>

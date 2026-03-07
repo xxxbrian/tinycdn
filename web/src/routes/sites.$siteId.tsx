@@ -2,6 +2,7 @@ import { Outlet, Link, createFileRoute, useRouterState } from "@tanstack/react-r
 import { Globe, Settings2, Shield, Workflow } from "lucide-react";
 
 import { api } from "@/lib/api";
+import { CachePurgeSheet } from "@/components/cache-purge-sheet";
 import { getPrimaryCacheMode, getSiteStats } from "@/lib/site-metrics";
 import { PageHeader } from "@/components/page-header";
 import { SiteShell } from "@/components/site-shell";
@@ -62,6 +63,7 @@ function SiteOverviewPage() {
                 Origin
               </Link>
             </Button>
+            <CachePurgeSheet site={site} />
             <Button asChild>
               <Link to="/sites/$siteId/rules" params={{ siteId: site.id }}>
                 <Workflow className="size-4" />
@@ -167,6 +169,17 @@ function SiteOverviewPage() {
             <div className="flex items-center justify-between rounded-lg border p-3">
               <span className="text-muted-foreground">Origin</span>
               <code className="max-w-[16rem] truncate">{site.upstream.url}</code>
+            </div>
+            <div className="rounded-lg border p-3">
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <div className="font-medium">Manual invalidation</div>
+                  <p className="mt-1 text-sm text-muted-foreground">
+                    Purge everything or target specific URLs from the overview action bar.
+                  </p>
+                </div>
+                <Badge variant="secondary">Ready</Badge>
+              </div>
             </div>
           </CardContent>
         </Card>
