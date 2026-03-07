@@ -1,4 +1,13 @@
-import { Globe, Radar, Shield, SlidersHorizontal, Undo, Workflow } from "lucide-react";
+import {
+  Activity,
+  Globe,
+  Logs,
+  Radar,
+  Shield,
+  SlidersHorizontal,
+  Undo,
+  Workflow,
+} from "lucide-react";
 import { Link, useRouterState } from "@tanstack/react-router";
 
 import type { Site } from "@/types";
@@ -33,6 +42,18 @@ export function SiteSidebar({ site }: { site: Site }) {
       to: "/sites/$siteId/rules",
       href: `/sites/${site.id}/rules`,
       icon: Workflow,
+    },
+    {
+      title: "Analytics",
+      to: "/sites/$siteId/analytics",
+      href: `/sites/${site.id}/analytics`,
+      icon: Activity,
+    },
+    {
+      title: "Logs",
+      to: "/sites/$siteId/logs",
+      href: `/sites/${site.id}/logs`,
+      icon: Logs,
     },
     {
       title: "Origin",
