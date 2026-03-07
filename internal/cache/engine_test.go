@@ -98,6 +98,10 @@ func (s *memoryStore) DeletePrefix(_ context.Context, prefix string) (int, error
 	return deleted, nil
 }
 
+func (s *memoryStore) Inventory(_ context.Context) ([]Inventory, error) {
+	return nil, nil
+}
+
 func (s *memoryStore) Close() error {
 	return nil
 }
@@ -118,16 +122,20 @@ func (s *errorStore) PutVary(_ context.Context, _ string, _ VarySpec) error {
 	return s.putErr
 }
 
-func (s *errorStore) Delete(_ context.Context, _ string) error {
-	return nil
+func (s *errorStore) ImportBody(_ context.Context, tempPath string) (string, error) {
+	return tempPath, s.putErr
 }
 
-func (s *errorStore) ImportBody(_ context.Context, _ string) (string, error) {
-	return "", s.putErr
+func (s *errorStore) Delete(_ context.Context, _ string) error {
+	return s.putErr
 }
 
 func (s *errorStore) DeletePrefix(_ context.Context, _ string) (int, error) {
-	return 0, nil
+	return 0, s.putErr
+}
+
+func (s *errorStore) Inventory(_ context.Context) ([]Inventory, error) {
+	return nil, s.putErr
 }
 
 func (s *errorStore) Close() error {

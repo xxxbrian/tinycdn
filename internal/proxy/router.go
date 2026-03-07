@@ -8,9 +8,13 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"time"
+
+	"github.com/google/uuid"
 
 	"tinycdn/internal/cache"
 	"tinycdn/internal/httpx"
+	"tinycdn/internal/observe"
 	"tinycdn/internal/runtime"
 )
 
@@ -19,6 +23,7 @@ const (
 	headerTinyCDNSite  = "X-TinyCDN-Site"
 	headerTinyCDNRule  = "X-TinyCDN-Rule"
 	headerCacheStatus  = "Cache-Status"
+	headerRequestID    = "X-TinyCDN-Request-ID"
 )
 
 type Router struct {
@@ -26,9 +31,10 @@ type Router struct {
 	store    cache.Store
 	fetcher  *upstreamFetcher
 	snapshot func() *runtime.Snapshot
+	recorder observe.Recorder
 }
 
-func NewRouter(snapshot func() *runtime.Snapshot, cachePath string) (*Router, error) {
+func NewRouter(snapshot func() *runtime.Snapshot, cachePath string, recorder observe.Recorder) (*Router, error) {
 	store, err := cache.NewBadgerStore(cachePath)
 	if err != nil {
 		return nil, err
@@ -38,12 +44,16 @@ func NewRouter(snapshot func() *runtime.Snapshot, cachePath string) (*Router, er
 		_ = store.Close()
 		return nil, err
 	}
+	if recorder == nil {
+		recorder = observe.NopRecorder{}
+	}
 
 	return &Router{
 		engine:   cache.NewEngine(store),
 		store:    store,
 		fetcher:  fetcher,
 		snapshot: snapshot,
+		recorder: recorder,
 	}, nil
 }
 
@@ -59,72 +69,160 @@ func (r *Router) PurgeURL(ctx context.Context, siteID, path, rawQuery string) (i
 	return r.engine.PurgeURL(ctx, siteID, path, rawQuery)
 }
 
+func (r *Router) CacheInventory(ctx context.Context) ([]cache.Inventory, error) {
+	return r.store.Inventory(ctx)
+}
+
 func (r *Router) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
+	startedAt := time.Now()
+	responseWriter := httpx.NewStatusCapturingResponseWriter(rw)
+	requestID := uuid.NewString()
+	responseWriter.Header().Set(headerRequestID, requestID)
+
+	event := observe.RequestEvent{
+		Timestamp: startedAt.UTC(),
+		RequestID: requestID,
+		Method:    req.Method,
+		Scheme:    requestScheme(req),
+		Host:      req.Host,
+		Path:      req.URL.Path,
+		RawQuery:  req.URL.RawQuery,
+		RemoteIP:  forwardedClientIP(req.RemoteAddr),
+		UserAgent: req.UserAgent(),
+		Referer:   req.Referer(),
+	}
+	defer func() {
+		event.StatusCode = responseWriter.StatusCode()
+		event.ResponseBytes = responseWriter.BytesWritten()
+		event.TotalDurationMS = time.Since(startedAt).Milliseconds()
+		if event.ContentType == "" {
+			event.ContentType = responseWriter.Header().Get("Content-Type")
+		}
+		r.recorder.RecordRequest(event)
+	}()
+
 	if req.URL.Path == "/healthz" {
-		rw.WriteHeader(http.StatusOK)
-		_, _ = rw.Write([]byte("ok"))
+		responseWriter.WriteHeader(http.StatusOK)
+		_, _ = responseWriter.Write([]byte("ok"))
 		return
 	}
 
 	current := r.snapshot()
 	site := current.SiteByHost(req.Host)
 	if site == nil || !site.Source.Enabled {
-		http.NotFound(rw, req)
+		event.CacheState = string(cache.StateBypass)
+		event.CacheStatus = "TinyCDN; fwd=bypass; detail=site-not-found"
+		event.ErrorKind = "site_not_found"
+		http.NotFound(responseWriter, req)
 		return
 	}
+	event.SiteID = site.Source.ID
+	event.SiteName = site.Source.Name
+	event.UpstreamHost = site.UpstreamHost
 
 	rule := site.MatchRule(req)
 	if rule == nil {
-		http.Error(rw, "no matching rule in runtime snapshot", http.StatusInternalServerError)
+		event.CacheState = string(cache.StateError)
+		event.CacheStatus = "TinyCDN; fwd=error; detail=RULE"
+		event.ErrorKind = "rule_match"
+		http.Error(responseWriter, "no matching rule in runtime snapshot", http.StatusInternalServerError)
 		return
 	}
+	event.RuleID = rule.Source.ID
 
 	policy := cache.BuildPolicy(site.Source.ID, rule.Source, rule.TTL, rule.HasTTL, rule.StaleIfError, rule.HasStaleIfError)
 	if cache.PreviewRequestBehavior(req, policy) == cache.StateBypass {
-		r.streamBypass(rw, req, site, rule, "request")
+		r.streamBypass(responseWriter, req, site, rule, &event, "request")
 		return
 	}
 
 	result, plan, err := r.engine.Start(req.Context(), req, policy)
 	if err != nil {
 		if errors.Is(err, ErrUpstreamResponseTooLarge) {
-			r.streamBypass(rw, req, site, rule, "object-too-large")
+			r.streamBypass(responseWriter, req, site, rule, &event, "object-too-large")
 			return
 		}
-		writeErrorResponse(rw, site, rule, err)
+		event.CacheState = string(cache.StateError)
+		event.CacheStatus = "TinyCDN; fwd=error; detail=UPSTREAM"
+		event.ErrorKind = "engine_start"
+		writeErrorResponse(responseWriter, site, rule, err)
 		return
 	}
 	if plan != nil {
 		if result.State == cache.StateStale {
+			event.CacheState = string(result.State)
+			event.CacheStatus = result.CacheStatus
 			go r.fillInBackground(site, plan)
-			writeResult(rw, req, site, rule, result)
+			writeResult(responseWriter, req, site, rule, result)
 			return
 		}
-		r.streamFill(rw, req, site, rule, plan)
+		r.streamFill(responseWriter, req, site, rule, plan, &event)
 		return
 	}
 
-	writeResult(rw, req, site, rule, result)
+	event.CacheState = string(result.State)
+	event.CacheStatus = result.CacheStatus
+	writeResult(responseWriter, req, site, rule, result)
 }
 
 func (r *Router) fillInBackground(site *runtime.CompiledSite, plan *cache.FillPlan) {
 	ctx, cancel := context.WithTimeout(context.Background(), defaultUpstreamTimeout)
 	defer cancel()
 
+	startedAt := time.Now()
+	event := observe.RequestEvent{
+		Timestamp:    startedAt.UTC(),
+		RequestID:    uuid.NewString(),
+		SiteID:       site.Source.ID,
+		SiteName:     site.Source.Name,
+		RuleID:       plan.Policy().RuleID,
+		IsInternal:   true,
+		Method:       plan.OriginalMethod(),
+		Scheme:       requestScheme(plan.PreparedRequest),
+		Host:         plan.PreparedRequest.Host,
+		Path:         plan.PreparedRequest.URL.Path,
+		RawQuery:     plan.PreparedRequest.URL.RawQuery,
+		RemoteIP:     "127.0.0.1",
+		CacheState:   "REFRESH",
+		CacheStatus:  "TinyCDN; fwd=refresh",
+		UpstreamHost: site.UpstreamHost,
+	}
+
 	response, err := r.fetcher.Fetch(ctx, plan.Request(ctx), site)
+	event.OriginRequests = 1
+	event.OriginDurationMS = time.Since(startedAt).Milliseconds()
 	if err != nil {
+		event.ErrorKind = "background_refresh"
+		event.StatusCode = http.StatusBadGateway
+		event.TotalDurationMS = event.OriginDurationMS
+		r.recorder.RecordRequest(event)
 		_, _ = r.engine.HandleFillError(plan, err)
 		return
 	}
+	event.OriginStatusCode = response.StatusCode
+	event.StatusCode = response.StatusCode
+	event.ResponseBytes = response.ContentLength
+	event.ContentType = response.Header.Get("Content-Type")
+	event.TotalDurationMS = time.Since(startedAt).Milliseconds()
 	if _, ok, err := r.engine.RevalidatedResult(ctx, plan, response); err != nil {
+		event.ErrorKind = "background_revalidate"
+		r.recorder.RecordRequest(event)
 		return
 	} else if ok {
+		event.CacheState = string(cache.StateHit)
+		event.CacheStatus = "TinyCDN; stored=revalidated"
+		r.recorder.RecordRequest(event)
 		if response.CleanupPath {
 			_ = os.Remove(response.BodyPath)
 		}
 		return
 	}
-	_ = r.engine.CompleteFill(ctx, plan, response)
+	if err := r.engine.CompleteFill(ctx, plan, response); err != nil {
+		event.ErrorKind = "background_store"
+		r.recorder.RecordRequest(event)
+		return
+	}
+	r.recorder.RecordRequest(event)
 }
 
 func writeResult(rw http.ResponseWriter, req *http.Request, site *runtime.CompiledSite, rule *runtime.CompiledRule, result cache.Result) {
@@ -162,32 +260,50 @@ func writeResult(rw http.ResponseWriter, req *http.Request, site *runtime.Compil
 	_, _ = rw.Write(result.Body)
 }
 
-func (r *Router) streamFill(rw http.ResponseWriter, req *http.Request, site *runtime.CompiledSite, rule *runtime.CompiledRule, plan *cache.FillPlan) {
+func (r *Router) streamFill(rw http.ResponseWriter, req *http.Request, site *runtime.CompiledSite, rule *runtime.CompiledRule, plan *cache.FillPlan, event *observe.RequestEvent) {
+	originStartedAt := time.Now()
 	resp, err := r.fetcher.Open(req.Context(), plan.Request(req.Context()), site)
+	event.OriginRequests = 1
+	event.OriginDurationMS = time.Since(originStartedAt).Milliseconds()
 	if err != nil {
+		event.ErrorKind = "origin_fetch"
 		if fallback, ok := r.engine.HandleFillError(plan, err); ok {
+			event.CacheState = string(fallback.State)
+			event.CacheStatus = fallback.CacheStatus
 			writeResult(rw, req, site, rule, fallback)
 			return
 		}
+		event.CacheState = string(cache.StateError)
+		event.CacheStatus = "TinyCDN; fwd=error; detail=UPSTREAM"
 		writeErrorResponse(rw, site, rule, err)
 		return
 	}
 	defer resp.Body.Close()
+	event.OriginStatusCode = resp.StatusCode
+	event.ContentType = resp.Header.Get("Content-Type")
 
 	if result, ok, err := r.engine.RevalidatedResult(req.Context(), plan, cache.StoredResponse{
 		StatusCode: resp.StatusCode,
 		Header:     resp.Header.Clone(),
 	}); err != nil {
+		event.ErrorKind = "revalidate"
+		event.CacheState = string(cache.StateError)
+		event.CacheStatus = "TinyCDN; fwd=error; detail=REVALIDATE"
 		writeErrorResponse(rw, site, rule, err)
 		return
 	} else if ok {
+		event.CacheState = string(result.State)
+		event.CacheStatus = result.CacheStatus
 		writeResult(rw, req, site, rule, result)
 		return
 	}
 
 	if responseTooLarge(resp, r.fetcher.maxCacheableObjectBytes) {
 		r.engine.AbortFill(plan, cache.StoredResponse{})
+		event.CacheState = string(cache.StateBypass)
+		event.CacheStatus = "TinyCDN; fwd=bypass; detail=object-too-large"
 		r.writeStreamedResponse(rw, req, site, rule, resp, cache.StateBypass, "TinyCDN; fwd=bypass; detail=object-too-large")
+		event.OriginDurationMS = time.Since(originStartedAt).Milliseconds()
 		return
 	}
 
@@ -195,12 +311,14 @@ func (r *Router) streamFill(rw http.ResponseWriter, req *http.Request, site *run
 	httpx.StripHopByHopHeaders(responseHeader)
 
 	if err := os.MkdirAll(r.fetcher.tempDir, 0o755); err != nil {
+		event.ErrorKind = "temp_dir"
 		r.engine.AbortFill(plan, cache.StoredResponse{})
 		writeErrorResponse(rw, site, rule, err)
 		return
 	}
 	tempFile, err := os.CreateTemp(r.fetcher.tempDir, "body-*")
 	if err != nil {
+		event.ErrorKind = "temp_file"
 		r.engine.AbortFill(plan, cache.StoredResponse{})
 		writeErrorResponse(rw, site, rule, err)
 		return
@@ -243,23 +361,41 @@ func (r *Router) streamFill(rw http.ResponseWriter, req *http.Request, site *run
 		copyErr = closeErr
 	}
 	if copyErr != nil {
+		event.ErrorKind = "stream_copy"
+		event.OriginDurationMS = time.Since(originStartedAt).Milliseconds()
 		r.engine.AbortFill(plan, stored)
 		return
 	}
 	if err := r.engine.CompleteFill(req.Context(), plan, stored); err != nil {
+		event.ErrorKind = "store_fill"
+		event.OriginDurationMS = time.Since(originStartedAt).Milliseconds()
 		return
 	}
+	event.CacheState = string(cache.StateMiss)
+	event.CacheStatus = r.engine.MissCacheStatus(plan)
+	event.OriginDurationMS = time.Since(originStartedAt).Milliseconds()
 }
 
-func (r *Router) streamBypass(rw http.ResponseWriter, req *http.Request, site *runtime.CompiledSite, rule *runtime.CompiledRule, detail string) {
+func (r *Router) streamBypass(rw http.ResponseWriter, req *http.Request, site *runtime.CompiledSite, rule *runtime.CompiledRule, event *observe.RequestEvent, detail string) {
+	originStartedAt := time.Now()
 	resp, err := r.fetcher.Open(req.Context(), req, site)
+	event.OriginRequests = 1
+	event.OriginDurationMS = time.Since(originStartedAt).Milliseconds()
 	if err != nil {
+		event.ErrorKind = "bypass_fetch"
+		event.CacheState = string(cache.StateError)
+		event.CacheStatus = "TinyCDN; fwd=error; detail=UPSTREAM"
 		writeErrorResponse(rw, site, rule, err)
 		return
 	}
 	defer resp.Body.Close()
 
+	event.OriginStatusCode = resp.StatusCode
+	event.ContentType = resp.Header.Get("Content-Type")
+	event.CacheState = string(cache.StateBypass)
+	event.CacheStatus = "TinyCDN; fwd=bypass; detail=" + detail
 	r.writeStreamedResponse(rw, req, site, rule, resp, cache.StateBypass, "TinyCDN; fwd=bypass; detail="+detail)
+	event.OriginDurationMS = time.Since(originStartedAt).Milliseconds()
 }
 
 func (r *Router) writeStreamedResponse(rw http.ResponseWriter, req *http.Request, site *runtime.CompiledSite, rule *runtime.CompiledRule, resp *http.Response, state cache.State, cacheStatus string) {

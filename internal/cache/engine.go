@@ -102,6 +102,14 @@ func (p *FillPlan) Request(ctx context.Context) *http.Request {
 	return req
 }
 
+func (p *FillPlan) Policy() Policy {
+	return p.policy
+}
+
+func (p *FillPlan) OriginalMethod() string {
+	return p.originalMethod
+}
+
 type inflightFill struct {
 	done chan struct{}
 }

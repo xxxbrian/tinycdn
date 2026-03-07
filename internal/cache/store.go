@@ -32,7 +32,14 @@ type Store interface {
 	ImportBody(ctx context.Context, tempPath string) (string, error)
 	Delete(ctx context.Context, key string) error
 	DeletePrefix(ctx context.Context, prefix string) (int, error)
+	Inventory(ctx context.Context) ([]Inventory, error)
 	Close() error
+}
+
+type Inventory struct {
+	SiteID  string
+	Objects int64
+	Bytes   int64
 }
 
 type BadgerStore struct {
@@ -278,6 +285,50 @@ func (s *BadgerStore) DeletePrefix(ctx context.Context, prefix string) (int, err
 
 func (s *BadgerStore) Close() error {
 	return s.db.Close()
+}
+
+func (s *BadgerStore) Inventory(ctx context.Context) ([]Inventory, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	bySite := map[string]Inventory{}
+	err := s.db.View(func(txn *badger.Txn) error {
+		opts := badger.DefaultIteratorOptions
+		it := txn.NewIterator(opts)
+		defer it.Close()
+
+		for it.Seek([]byte("resp|")); it.ValidForPrefix([]byte("resp|")); it.Next() {
+			item := it.Item()
+			if err := item.Value(func(value []byte) error {
+				entry, err := decodeEntry(append([]byte(nil), value...))
+				if err != nil {
+					return err
+				}
+				current := bySite[entry.SiteID]
+				current.SiteID = entry.SiteID
+				current.Objects++
+				current.Bytes += entry.Response.ContentLength
+				bySite[entry.SiteID] = current
+				return nil
+			}); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	inventory := make([]Inventory, 0, len(bySite))
+	for _, item := range bySite {
+		inventory = append(inventory, item)
+	}
+	slices.SortFunc(inventory, func(a, b Inventory) int {
+		return strings.Compare(a.SiteID, b.SiteID)
+	})
+	return inventory, nil
 }
 
 func (s *BadgerStore) pruneOrphanBodies(ctx context.Context) error {

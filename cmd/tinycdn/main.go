@@ -16,15 +16,17 @@ import (
 	"tinycdn/internal/config"
 	"tinycdn/internal/proxy"
 	"tinycdn/internal/runtime"
+	"tinycdn/internal/telemetry"
 )
 
 func main() {
 	var (
-		adminAddr  = flag.String("admin-addr", ":8787", "admin API and UI listen address")
-		proxyAddr  = flag.String("proxy-addr", ":8080", "proxy data-plane listen address")
-		configPath = flag.String("config", "./data/config.yaml", "path to persisted YAML config")
-		uiDir      = flag.String("ui-dir", "./web/dist", "path to built frontend assets")
-		cacheDir   = flag.String("cache-dir", "./data/cache/badger", "path to TinyCDN badger cache directory")
+		adminAddr   = flag.String("admin-addr", ":8787", "admin API and UI listen address")
+		proxyAddr   = flag.String("proxy-addr", ":8080", "proxy data-plane listen address")
+		configPath  = flag.String("config", "./data/config.yaml", "path to persisted YAML config")
+		uiDir       = flag.String("ui-dir", "./web/dist", "path to built frontend assets")
+		cacheDir    = flag.String("cache-dir", "./data/cache/badger", "path to TinyCDN badger cache directory")
+		telemetryDB = flag.String("telemetry-db", "./data/telemetry/telemetry.db", "path to TinyCDN telemetry SQLite database")
 	)
 	flag.Parse()
 
@@ -54,17 +56,26 @@ func main() {
 
 	runtimeManager := runtime.NewManager(snapshot)
 	service := app.NewService(store, runtimeManager, cfg)
-	proxyRouter, err := proxy.NewRouter(service.RuntimeSnapshot, *cacheDir)
+	telemetryService, err := telemetry.NewService(*telemetryDB, logger)
+	if err != nil {
+		logger.Error("failed to initialize telemetry service", "error", err)
+		os.Exit(1)
+	}
+	proxyRouter, err := proxy.NewRouter(service.RuntimeSnapshot, *cacheDir, telemetryService)
 	if err != nil {
 		logger.Error("failed to initialize proxy router", "error", err)
+		_ = telemetryService.Close()
 		os.Exit(1)
 	}
 	service.SetCacheController(proxyRouter)
 	adminServer := &http.Server{
 		Addr:    *adminAddr,
-		Handler: admin.NewRouter(service, *uiDir),
+		Handler: admin.NewRouter(service, telemetryService, *uiDir),
 	}
 	defer func() {
+		if err := telemetryService.Close(); err != nil {
+			logger.Error("telemetry service shutdown failed", "error", err)
+		}
 		if err := proxyRouter.Close(); err != nil {
 			logger.Error("proxy router shutdown failed", "error", err)
 		}

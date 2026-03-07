@@ -10,6 +10,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"tinycdn/internal/cache"
 	"tinycdn/internal/config"
 	"tinycdn/internal/model"
 	"tinycdn/internal/runtime"
@@ -27,6 +28,7 @@ type Service struct {
 type CacheController interface {
 	PurgeSite(context.Context, string) (int, error)
 	PurgeURL(context.Context, string, string, string) (int, error)
+	CacheInventory(context.Context) ([]cache.Inventory, error)
 }
 
 func NewService(store *config.Store, runtimeManager *runtime.Manager, cfg model.AppConfig) *Service {
@@ -45,6 +47,16 @@ func (s *Service) SetCacheController(controller CacheController) {
 
 func (s *Service) RuntimeSnapshot() *runtime.Snapshot {
 	return s.runtime.Get()
+}
+
+func (s *Service) CacheInventory(ctx context.Context) ([]cache.Inventory, error) {
+	s.mu.RLock()
+	controller := s.cache
+	s.mu.RUnlock()
+	if controller == nil {
+		return nil, nil
+	}
+	return controller.CacheInventory(ctx)
 }
 
 func (s *Service) Config() model.AppConfig {

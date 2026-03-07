@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"tinycdn/internal/cache"
 	"tinycdn/internal/config"
 	"tinycdn/internal/model"
 	"tinycdn/internal/runtime"
@@ -31,6 +32,10 @@ func (f *fakeCacheController) PurgeURL(_ context.Context, siteID, path, rawQuery
 		rawQuery string
 	}{siteID: siteID, path: path, rawQuery: rawQuery})
 	return 2, nil
+}
+
+func (f *fakeCacheController) CacheInventory(_ context.Context) ([]cache.Inventory, error) {
+	return nil, nil
 }
 
 func TestCreateRulePreservesDisabledState(t *testing.T) {

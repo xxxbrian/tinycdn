@@ -315,7 +315,7 @@ func TestRouterStripsHopByHopResponseHeaders(t *testing.T) {
 
 func newTestRouter(t *testing.T, snapshot *runtime.Snapshot) *Router {
 	t.Helper()
-	router, err := NewRouter(func() *runtime.Snapshot { return snapshot }, filepath.Join(t.TempDir(), "badger"))
+	router, err := NewRouter(func() *runtime.Snapshot { return snapshot }, filepath.Join(t.TempDir(), "badger"), nil)
 	if err != nil {
 		t.Fatalf("new router: %v", err)
 	}
