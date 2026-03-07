@@ -168,7 +168,7 @@ func TestRouterServesCachedBodyAfterOriginRevalidation(t *testing.T) {
 	}
 }
 
-func TestRouterBypassesRangeRequests(t *testing.T) {
+func TestRouterFallsBackToSingleOriginFetchWhenOriginIgnoresRange(t *testing.T) {
 	var upstreamHits atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
 		upstreamHits.Add(1)
@@ -190,14 +190,71 @@ func TestRouterBypassesRangeRequests(t *testing.T) {
 	second := httptest.NewRecorder()
 	router.ServeHTTP(second, req)
 
-	if got := first.Result().Header.Get(headerTinyCDNCache); got != "BYPASS" {
-		t.Fatalf("expected range request BYPASS, got %q", got)
+	if got := first.Result().Header.Get(headerTinyCDNCache); got != "MISS" {
+		t.Fatalf("expected first unsupported range request MISS, got %q", got)
 	}
-	if got := second.Result().Header.Get(headerTinyCDNCache); got != "BYPASS" {
-		t.Fatalf("expected repeated range request BYPASS, got %q", got)
+	if got := second.Result().Header.Get(headerTinyCDNCache); got != "MISS" {
+		t.Fatalf("expected second unsupported range request MISS, got %q", got)
 	}
 	if got := upstreamHits.Load(); got != 2 {
-		t.Fatalf("expected two upstream hits for range bypass, got %d", got)
+		t.Fatalf("expected two upstream hits for uncached range fallback, got %d", got)
+	}
+	if got := first.Result().StatusCode; got != http.StatusPartialContent {
+		t.Fatalf("expected partial content status, got %d", got)
+	}
+	if body := first.Body.String(); body != "payload" {
+		t.Fatalf("unexpected body %q", body)
+	}
+}
+
+func TestRouterCachesAlignedRangeChunks(t *testing.T) {
+	var upstreamHits atomic.Int32
+	payload := []byte("abcdefghijklmnopqrstuvwxyz")
+	upstream := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		upstreamHits.Add(1)
+		rangeHeader := req.Header.Get("Range")
+		if rangeHeader == "" {
+			t.Fatalf("expected aligned range request")
+		}
+		if rangeHeader != "bytes=0-1048575" {
+			t.Fatalf("unexpected aligned range %q", rangeHeader)
+		}
+		rw.Header().Set("Content-Type", "text/plain")
+		rw.Header().Set("Content-Range", "bytes 0-25/26")
+		rw.WriteHeader(http.StatusPartialContent)
+		_, _ = rw.Write(payload)
+	}))
+	defer upstream.Close()
+
+	router := newTestRouter(t, newTestSnapshot(t, upstream.URL))
+	defer router.Close()
+
+	firstReq := httptest.NewRequest(http.MethodGet, "http://cdn.example.com/assets/app.txt", nil)
+	firstReq.Host = "cdn.example.com"
+	firstReq.Header.Set("Range", "bytes=5-9")
+	first := httptest.NewRecorder()
+	router.ServeHTTP(first, firstReq)
+
+	secondReq := httptest.NewRequest(http.MethodGet, "http://cdn.example.com/assets/app.txt", nil)
+	secondReq.Host = "cdn.example.com"
+	secondReq.Header.Set("Range", "bytes=8-12")
+	second := httptest.NewRecorder()
+	router.ServeHTTP(second, secondReq)
+
+	if got := first.Result().Header.Get(headerTinyCDNCache); got != "MISS" {
+		t.Fatalf("expected first range request MISS, got %q", got)
+	}
+	if got := second.Result().Header.Get(headerTinyCDNCache); got != "HIT" {
+		t.Fatalf("expected overlapping range request HIT, got %q", got)
+	}
+	if body := first.Body.String(); body != "fghij" {
+		t.Fatalf("unexpected first body %q", body)
+	}
+	if body := second.Body.String(); body != "ijklm" {
+		t.Fatalf("unexpected second body %q", body)
+	}
+	if got := upstreamHits.Load(); got != 1 {
+		t.Fatalf("expected one aligned chunk fetch, got %d", got)
 	}
 }
 

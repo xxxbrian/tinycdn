@@ -27,11 +27,12 @@ const (
 )
 
 type Router struct {
-	engine   *cache.Engine
-	store    cache.Store
-	fetcher  *upstreamFetcher
-	snapshot func() *runtime.Snapshot
-	recorder observe.Recorder
+	engine     *cache.Engine
+	rangeCache *cache.RangeCache
+	store      cache.Store
+	fetcher    *upstreamFetcher
+	snapshot   func() *runtime.Snapshot
+	recorder   observe.Recorder
 }
 
 func NewRouter(snapshot func() *runtime.Snapshot, cachePath string, recorder observe.Recorder) (*Router, error) {
@@ -49,11 +50,12 @@ func NewRouter(snapshot func() *runtime.Snapshot, cachePath string, recorder obs
 	}
 
 	return &Router{
-		engine:   cache.NewEngine(store),
-		store:    store,
-		fetcher:  fetcher,
-		snapshot: snapshot,
-		recorder: recorder,
+		engine:     cache.NewEngine(store),
+		rangeCache: cache.NewRangeCache(store),
+		store:      store,
+		fetcher:    fetcher,
+		snapshot:   snapshot,
+		recorder:   recorder,
 	}, nil
 }
 
@@ -62,11 +64,27 @@ func (r *Router) Close() error {
 }
 
 func (r *Router) PurgeSite(ctx context.Context, siteID string) (int, error) {
-	return r.engine.PurgeSite(ctx, siteID)
+	regularDeleted, err := r.engine.PurgeSite(ctx, siteID)
+	if err != nil {
+		return 0, err
+	}
+	rangeDeleted, err := r.rangeCache.PurgeSite(ctx, siteID)
+	if err != nil {
+		return regularDeleted, err
+	}
+	return regularDeleted + rangeDeleted, nil
 }
 
 func (r *Router) PurgeURL(ctx context.Context, siteID, path, rawQuery string) (int, error) {
-	return r.engine.PurgeURL(ctx, siteID, path, rawQuery)
+	regularDeleted, err := r.engine.PurgeURL(ctx, siteID, path, rawQuery)
+	if err != nil {
+		return 0, err
+	}
+	rangeDeleted, err := r.rangeCache.PurgeURL(ctx, siteID, path, rawQuery)
+	if err != nil {
+		return regularDeleted, err
+	}
+	return regularDeleted + rangeDeleted, nil
 }
 
 func (r *Router) CacheInventory(ctx context.Context) ([]cache.Inventory, error) {
@@ -131,6 +149,26 @@ func (r *Router) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	event.RuleID = rule.Source.ID
 
 	policy := cache.BuildPolicy(site.Source.ID, rule.Source, rule.TTL, rule.HasTTL, rule.StaleIfError, rule.HasStaleIfError)
+	if r.rangeCache.CanHandle(req, policy) {
+		result, err := r.rangeCache.Handle(req.Context(), req, policy, func(ctx context.Context, upstreamReq *http.Request) (cache.StoredResponse, error) {
+			return r.fetcher.Fetch(ctx, upstreamReq, site)
+		})
+		if err == nil {
+			event.CacheState = string(result.State)
+			event.CacheStatus = result.CacheStatus
+			event.ContentType = result.Header.Get("Content-Type")
+			event.ResponseBytes = result.ContentLength
+			writeRangeResult(responseWriter, req, site, rule, result)
+			return
+		}
+		if !errors.Is(err, cache.ErrRangeBypass) {
+			event.CacheState = string(cache.StateError)
+			event.CacheStatus = "TinyCDN; fwd=error; detail=RANGE"
+			event.ErrorKind = "range_cache"
+			writeErrorResponse(responseWriter, site, rule, err)
+			return
+		}
+	}
 	if cache.PreviewRequestBehavior(req, policy) == cache.StateBypass {
 		r.streamBypass(responseWriter, req, site, rule, &event, "request")
 		return
@@ -258,6 +296,64 @@ func writeResult(rw http.ResponseWriter, req *http.Request, site *runtime.Compil
 		return
 	}
 	_, _ = rw.Write(result.Body)
+}
+
+func writeRangeResult(rw http.ResponseWriter, req *http.Request, site *runtime.CompiledSite, rule *runtime.CompiledRule, result cache.RangeResult) {
+	header := rw.Header()
+	for key, values := range result.Header {
+		for _, value := range values {
+			header.Add(key, value)
+		}
+	}
+	header.Set(headerTinyCDNCache, string(result.State))
+	header.Set(headerTinyCDNSite, site.Source.ID)
+	header.Set(headerTinyCDNRule, rule.Source.ID)
+	header.Set(headerCacheStatus, result.CacheStatus)
+	if result.ContentLength >= 0 {
+		header.Set("Content-Length", strconv.FormatInt(result.ContentLength, 10))
+	}
+
+	rw.WriteHeader(result.StatusCode)
+	if req.Method == http.MethodHead {
+		return
+	}
+
+	cleanupPaths := map[string]struct{}{}
+	defer func() {
+		for path := range cleanupPaths {
+			_ = os.Remove(path)
+		}
+	}()
+
+	for _, part := range result.Parts {
+		if part.CleanupPath && part.Path != "" {
+			cleanupPaths[part.Path] = struct{}{}
+		}
+		if len(part.Body) > 0 {
+			end := part.Offset + part.Length
+			if end > int64(len(part.Body)) {
+				end = int64(len(part.Body))
+			}
+			_, _ = rw.Write(part.Body[part.Offset:end])
+			continue
+		}
+		body, err := os.Open(part.Path)
+		if err != nil {
+			http.Error(rw, fmt.Sprintf("proxy body open error: %v", err), http.StatusInternalServerError)
+			return
+		}
+		if _, err := body.Seek(part.Offset, io.SeekStart); err != nil {
+			_ = body.Close()
+			http.Error(rw, fmt.Sprintf("proxy body seek error: %v", err), http.StatusInternalServerError)
+			return
+		}
+		if _, err := io.CopyN(rw, body, part.Length); err != nil && !errors.Is(err, io.EOF) {
+			_ = body.Close()
+			http.Error(rw, fmt.Sprintf("proxy body copy error: %v", err), http.StatusInternalServerError)
+			return
+		}
+		_ = body.Close()
+	}
 }
 
 func (r *Router) streamFill(rw http.ResponseWriter, req *http.Request, site *runtime.CompiledSite, rule *runtime.CompiledRule, plan *cache.FillPlan, event *observe.RequestEvent) {

@@ -14,9 +14,11 @@ import (
 )
 
 type memoryStore struct {
-	mu      sync.RWMutex
-	entries map[string]Entry
-	varies  map[string]VarySpec
+	mu           sync.RWMutex
+	entries      map[string]Entry
+	chunkObjects map[string]ChunkObject
+	chunks       map[string]ChunkEntry
+	varies       map[string]VarySpec
 }
 
 type errorStore struct {
@@ -27,8 +29,10 @@ type errorStore struct {
 
 func newMemoryStore() *memoryStore {
 	return &memoryStore{
-		entries: map[string]Entry{},
-		varies:  map[string]VarySpec{},
+		entries:      map[string]Entry{},
+		chunkObjects: map[string]ChunkObject{},
+		chunks:       map[string]ChunkEntry{},
+		varies:       map[string]VarySpec{},
 	}
 }
 
@@ -63,6 +67,37 @@ func (s *memoryStore) PutVary(_ context.Context, key string, spec VarySpec) erro
 	return nil
 }
 
+func (s *memoryStore) GetChunkObject(_ context.Context, key string) (ChunkObject, bool, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	object, ok := s.chunkObjects[key]
+	return object, ok, nil
+}
+
+func (s *memoryStore) PutChunkObject(_ context.Context, key string, object ChunkObject) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.chunkObjects[key] = object
+	return nil
+}
+
+func (s *memoryStore) GetChunk(_ context.Context, key string) (ChunkEntry, bool, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	chunk, ok := s.chunks[key]
+	return chunk, ok, nil
+}
+
+func (s *memoryStore) PutChunk(_ context.Context, key string, chunk ChunkEntry) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if existing, ok := s.chunks[key]; ok && existing.BodyPath != "" && existing.BodyPath != chunk.BodyPath {
+		_ = os.Remove(existing.BodyPath)
+	}
+	s.chunks[key] = chunk
+	return nil
+}
+
 func (s *memoryStore) ImportBody(_ context.Context, tempPath string) (string, error) {
 	return tempPath, nil
 }
@@ -73,7 +108,12 @@ func (s *memoryStore) Delete(_ context.Context, key string) error {
 	if entry, ok := s.entries[key]; ok {
 		_ = os.Remove(entry.Response.BodyPath)
 	}
+	if chunk, ok := s.chunks[key]; ok {
+		_ = os.Remove(chunk.BodyPath)
+	}
 	delete(s.entries, key)
+	delete(s.chunkObjects, key)
+	delete(s.chunks, key)
 	delete(s.varies, key)
 	return nil
 }
@@ -86,6 +126,19 @@ func (s *memoryStore) DeletePrefix(_ context.Context, prefix string) (int, error
 		if strings.HasPrefix(key, prefix) {
 			_ = os.Remove(s.entries[key].Response.BodyPath)
 			delete(s.entries, key)
+			deleted++
+		}
+	}
+	for key := range s.chunkObjects {
+		if strings.HasPrefix(key, prefix) {
+			delete(s.chunkObjects, key)
+			deleted++
+		}
+	}
+	for key := range s.chunks {
+		if strings.HasPrefix(key, prefix) {
+			_ = os.Remove(s.chunks[key].BodyPath)
+			delete(s.chunks, key)
 			deleted++
 		}
 	}
@@ -116,6 +169,22 @@ func (s *errorStore) PutEntry(_ context.Context, _ string, _ Entry) error {
 
 func (s *errorStore) GetVary(_ context.Context, _ string) (VarySpec, bool, error) {
 	return VarySpec{}, false, s.getVaryErr
+}
+
+func (s *errorStore) GetChunkObject(_ context.Context, _ string) (ChunkObject, bool, error) {
+	return ChunkObject{}, false, s.getEntryErr
+}
+
+func (s *errorStore) PutChunkObject(_ context.Context, _ string, _ ChunkObject) error {
+	return s.putErr
+}
+
+func (s *errorStore) GetChunk(_ context.Context, _ string) (ChunkEntry, bool, error) {
+	return ChunkEntry{}, false, s.getEntryErr
+}
+
+func (s *errorStore) PutChunk(_ context.Context, _ string, _ ChunkEntry) error {
+	return s.putErr
 }
 
 func (s *errorStore) PutVary(_ context.Context, _ string, _ VarySpec) error {

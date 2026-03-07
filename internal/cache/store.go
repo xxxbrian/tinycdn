@@ -24,9 +24,39 @@ type VarySpec struct {
 	Headers []string
 }
 
+type ChunkObject struct {
+	Key         string
+	SiteID      string
+	RuleID      string
+	PolicyTag   string
+	StoredAt    time.Time
+	FreshUntil  time.Time
+	StaleUntil  time.Time
+	InvalidAt   time.Time
+	BaseAge     int
+	Header      http.Header
+	TotalLength int64
+	ChunkSize   int64
+}
+
+type ChunkEntry struct {
+	Key       string
+	SiteID    string
+	ObjectKey string
+	Index     int64
+	StoredAt  time.Time
+	InvalidAt time.Time
+	BodyPath  string
+	Size      int64
+}
+
 type Store interface {
 	GetEntry(ctx context.Context, key string) (Entry, bool, error)
 	PutEntry(ctx context.Context, key string, entry Entry) error
+	GetChunkObject(ctx context.Context, key string) (ChunkObject, bool, error)
+	PutChunkObject(ctx context.Context, key string, object ChunkObject) error
+	GetChunk(ctx context.Context, key string) (ChunkEntry, bool, error)
+	PutChunk(ctx context.Context, key string, chunk ChunkEntry) error
 	GetVary(ctx context.Context, key string) (VarySpec, bool, error)
 	PutVary(ctx context.Context, key string, spec VarySpec) error
 	ImportBody(ctx context.Context, tempPath string) (string, error)
@@ -134,6 +164,128 @@ func (s *BadgerStore) PutEntry(ctx context.Context, key string, entry Entry) err
 	return nil
 }
 
+func (s *BadgerStore) GetChunkObject(ctx context.Context, key string) (ChunkObject, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return ChunkObject{}, false, err
+	}
+
+	var payload []byte
+	err := s.db.View(func(txn *badger.Txn) error {
+		item, err := txn.Get([]byte(key))
+		if err != nil {
+			return err
+		}
+
+		return item.Value(func(value []byte) error {
+			payload = append([]byte(nil), value...)
+			return nil
+		})
+	})
+	if errors.Is(err, badger.ErrKeyNotFound) {
+		return ChunkObject{}, false, nil
+	}
+	if err != nil {
+		return ChunkObject{}, false, err
+	}
+
+	object, err := decodeChunkObject(payload)
+	if err != nil {
+		return ChunkObject{}, false, err
+	}
+	return object, true, nil
+}
+
+func (s *BadgerStore) PutChunkObject(ctx context.Context, key string, object ChunkObject) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	payload, err := encodeChunkObject(object)
+	if err != nil {
+		return err
+	}
+
+	return s.db.Update(func(txn *badger.Txn) error {
+		e := badger.NewEntry([]byte(key), payload)
+		if !object.InvalidAt.IsZero() {
+			ttl := time.Until(object.InvalidAt)
+			if ttl <= 0 {
+				return txn.Delete([]byte(key))
+			}
+			e = e.WithTTL(ttl)
+		}
+		return txn.SetEntry(e)
+	})
+}
+
+func (s *BadgerStore) GetChunk(ctx context.Context, key string) (ChunkEntry, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return ChunkEntry{}, false, err
+	}
+
+	var payload []byte
+	err := s.db.View(func(txn *badger.Txn) error {
+		item, err := txn.Get([]byte(key))
+		if err != nil {
+			return err
+		}
+
+		return item.Value(func(value []byte) error {
+			payload = append([]byte(nil), value...)
+			return nil
+		})
+	})
+	if errors.Is(err, badger.ErrKeyNotFound) {
+		return ChunkEntry{}, false, nil
+	}
+	if err != nil {
+		return ChunkEntry{}, false, err
+	}
+
+	chunk, err := decodeChunkEntry(payload)
+	if err != nil {
+		return ChunkEntry{}, false, err
+	}
+	return chunk, true, nil
+}
+
+func (s *BadgerStore) PutChunk(ctx context.Context, key string, chunk ChunkEntry) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	existing, found, err := s.GetChunk(ctx, key)
+	if err != nil {
+		return err
+	}
+
+	payload, err := encodeChunkEntry(chunk)
+	if err != nil {
+		return err
+	}
+
+	if err := s.db.Update(func(txn *badger.Txn) error {
+		e := badger.NewEntry([]byte(key), payload)
+		if !chunk.InvalidAt.IsZero() {
+			ttl := time.Until(chunk.InvalidAt)
+			if ttl <= 0 {
+				return txn.Delete([]byte(key))
+			}
+			e = e.WithTTL(ttl)
+		}
+		return txn.SetEntry(e)
+	}); err != nil {
+		return err
+	}
+
+	if found && existing.BodyPath != "" && existing.BodyPath != chunk.BodyPath {
+		if err := removeBodyPath(existing.BodyPath); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *BadgerStore) GetVary(ctx context.Context, key string) (VarySpec, bool, error) {
 	if err := ctx.Err(); err != nil {
 		return VarySpec{}, false, err
@@ -211,6 +363,15 @@ func (s *BadgerStore) Delete(ctx context.Context, key string) error {
 		if err != nil {
 			return err
 		}
+	} else if strings.HasPrefix(key, "rchunk|") {
+		chunk, chunkFound, chunkErr := s.GetChunk(ctx, key)
+		if chunkErr != nil {
+			return chunkErr
+		}
+		if chunkFound {
+			found = true
+			entry.Response.BodyPath = chunk.BodyPath
+		}
 	}
 
 	err = s.db.Update(func(txn *badger.Txn) error {
@@ -240,20 +401,33 @@ func (s *BadgerStore) DeletePrefix(ctx context.Context, prefix string) (int, err
 		for it.Seek([]byte(prefix)); it.ValidForPrefix([]byte(prefix)); it.Next() {
 			item := it.Item()
 			keys = append(keys, slices.Clone(item.Key()))
-			if !strings.HasPrefix(string(item.Key()), "resp|") {
-				continue
-			}
-			if err := item.Value(func(value []byte) error {
-				entry, err := decodeEntry(append([]byte(nil), value...))
-				if err != nil {
+			switch {
+			case strings.HasPrefix(string(item.Key()), "resp|"):
+				if err := item.Value(func(value []byte) error {
+					entry, err := decodeEntry(append([]byte(nil), value...))
+					if err != nil {
+						return err
+					}
+					if entry.Response.BodyPath != "" {
+						blobPaths = append(blobPaths, entry.Response.BodyPath)
+					}
+					return nil
+				}); err != nil {
 					return err
 				}
-				if entry.Response.BodyPath != "" {
-					blobPaths = append(blobPaths, entry.Response.BodyPath)
+			case strings.HasPrefix(string(item.Key()), "rchunk|"):
+				if err := item.Value(func(value []byte) error {
+					chunk, err := decodeChunkEntry(append([]byte(nil), value...))
+					if err != nil {
+						return err
+					}
+					if chunk.BodyPath != "" {
+						blobPaths = append(blobPaths, chunk.BodyPath)
+					}
+					return nil
+				}); err != nil {
+					return err
 				}
-				return nil
-			}); err != nil {
-				return err
 			}
 		}
 		return nil
@@ -315,6 +489,23 @@ func (s *BadgerStore) Inventory(ctx context.Context) ([]Inventory, error) {
 				return err
 			}
 		}
+		for it.Seek([]byte("rchunk|")); it.ValidForPrefix([]byte("rchunk|")); it.Next() {
+			item := it.Item()
+			if err := item.Value(func(value []byte) error {
+				chunk, err := decodeChunkEntry(append([]byte(nil), value...))
+				if err != nil {
+					return err
+				}
+				current := bySite[chunk.SiteID]
+				current.SiteID = chunk.SiteID
+				current.Objects++
+				current.Bytes += chunk.Size
+				bySite[chunk.SiteID] = current
+				return nil
+			}); err != nil {
+				return err
+			}
+		}
 		return nil
 	})
 	if err != nil {
@@ -351,6 +542,21 @@ func (s *BadgerStore) pruneOrphanBodies(ctx context.Context) error {
 				}
 				if entry.Response.BodyPath != "" {
 					referenced[entry.Response.BodyPath] = struct{}{}
+				}
+				return nil
+			}); err != nil {
+				return err
+			}
+		}
+		for it.Seek([]byte("rchunk|")); it.ValidForPrefix([]byte("rchunk|")); it.Next() {
+			item := it.Item()
+			if err := item.Value(func(value []byte) error {
+				chunk, err := decodeChunkEntry(append([]byte(nil), value...))
+				if err != nil {
+					return err
+				}
+				if chunk.BodyPath != "" {
+					referenced[chunk.BodyPath] = struct{}{}
 				}
 				return nil
 			}); err != nil {
@@ -396,6 +602,34 @@ func decodeEntry(payload []byte) (Entry, error) {
 	var entry Entry
 	err := gob.NewDecoder(bytes.NewReader(payload)).Decode(&entry)
 	return entry, err
+}
+
+func encodeChunkObject(object ChunkObject) ([]byte, error) {
+	var buffer bytes.Buffer
+	if err := gob.NewEncoder(&buffer).Encode(object); err != nil {
+		return nil, err
+	}
+	return buffer.Bytes(), nil
+}
+
+func decodeChunkObject(payload []byte) (ChunkObject, error) {
+	var object ChunkObject
+	err := gob.NewDecoder(bytes.NewReader(payload)).Decode(&object)
+	return object, err
+}
+
+func encodeChunkEntry(chunk ChunkEntry) ([]byte, error) {
+	var buffer bytes.Buffer
+	if err := gob.NewEncoder(&buffer).Encode(chunk); err != nil {
+		return nil, err
+	}
+	return buffer.Bytes(), nil
+}
+
+func decodeChunkEntry(payload []byte) (ChunkEntry, error) {
+	var chunk ChunkEntry
+	err := gob.NewDecoder(bytes.NewReader(payload)).Decode(&chunk)
+	return chunk, err
 }
 
 func encodeVarySpec(spec VarySpec) ([]byte, error) {
