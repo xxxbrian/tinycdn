@@ -294,6 +294,9 @@ func decideStore(now time.Time, policy Policy, response StoredResponse) storeDec
 	if !isCacheableStatus(response.StatusCode) || response.Header.Get("Content-Range") != "" {
 		return storeDecision{}
 	}
+	if len(response.Header.Values("Set-Cookie")) > 0 {
+		return storeDecision{}
+	}
 
 	switch policy.Mode {
 	case model.CacheModeBypass:
@@ -400,6 +403,9 @@ func prepareRequest(req *http.Request, policy Policy) (*http.Request, State) {
 	if policy.Mode == model.CacheModeBypass {
 		return cloned, StateBypass
 	}
+	if hasSharedCacheSensitiveRequestHeaders(req.Header) {
+		return cloned, StateBypass
+	}
 	if req.Header.Get("Range") != "" {
 		return cloned, StateBypass
 	}
@@ -414,6 +420,10 @@ func prepareRequest(req *http.Request, policy Policy) (*http.Request, State) {
 	}
 
 	return cloned, StateMiss
+}
+
+func hasSharedCacheSensitiveRequestHeaders(header http.Header) bool {
+	return header.Get("Authorization") != "" || len(header.Values("Cookie")) > 0
 }
 
 func shouldForceRefresh(req *http.Request, policy Policy) bool {

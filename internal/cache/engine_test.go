@@ -278,6 +278,65 @@ func TestEngineForceCacheStripsClientValidators(t *testing.T) {
 	}
 }
 
+func TestEngineBypassesSharedSensitiveRequests(t *testing.T) {
+	tests := []struct {
+		name   string
+		header http.Header
+	}{
+		{
+			name:   "authorization header",
+			header: http.Header{"Authorization": {"Bearer secret"}},
+		},
+		{
+			name:   "cookie header",
+			header: http.Header{"Cookie": {"session=abc123"}},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := newMemoryStore()
+			engine := NewEngine(store)
+			policy := Policy{
+				SiteID:    "site-1",
+				RuleID:    "rule-1",
+				PolicyTag: "rule-1|force",
+				Mode:      model.CacheModeForceCache,
+				TTL:       time.Minute,
+				HasTTL:    true,
+			}
+
+			req := httptest.NewRequest(http.MethodGet, "https://cdn.example.com/account", nil)
+			req.Header = tt.header.Clone()
+			fetches := 0
+			fetch := func(_ context.Context, req *http.Request) (StoredResponse, error) {
+				fetches++
+				return StoredResponse{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": {"text/plain"}},
+					Body:       []byte("private"),
+				}, nil
+			}
+
+			first, err := engine.Handle(context.Background(), req, policy, fetch)
+			if err != nil {
+				t.Fatalf("first handle: %v", err)
+			}
+			second, err := engine.Handle(context.Background(), req, policy, fetch)
+			if err != nil {
+				t.Fatalf("second handle: %v", err)
+			}
+
+			if first.State != StateBypass || second.State != StateBypass {
+				t.Fatalf("expected sensitive shared-cache request to bypass, got %s then %s", first.State, second.State)
+			}
+			if fetches != 2 {
+				t.Fatalf("expected two upstream fetches, got %d", fetches)
+			}
+		})
+	}
+}
+
 func TestEngineFollowOriginRespectsCacheControl(t *testing.T) {
 	store := newMemoryStore()
 	engine := NewEngine(store)
@@ -667,6 +726,13 @@ func TestEngineFollowOriginRequestAndResponseMatrix(t *testing.T) {
 			wantFetches: 2,
 		},
 		{
+			name:        "set-cookie response is not stored",
+			header:      http.Header{"Cache-Control": {"public, max-age=30"}, "Set-Cookie": {"session=abc123; Path=/; HttpOnly"}},
+			wantStored:  false,
+			wantSecond:  StateMiss,
+			wantFetches: 2,
+		},
+		{
 			name:        "multi header cache-control is parsed",
 			header:      http.Header{"Cache-Control": {"public", "s-maxage=30"}},
 			wantStored:  true,
@@ -855,6 +921,47 @@ func TestBadgerCacheHelpers(t *testing.T) {
 	expected := []string{"Accept-Encoding", "Accept-Language", "Origin"}
 	if strings.Join(headers, ",") != strings.Join(expected, ",") {
 		t.Fatalf("unexpected vary headers: %#v", headers)
+	}
+}
+
+func TestEntryResultDoesNotReplaySetCookieWhenNotStored(t *testing.T) {
+	store := newMemoryStore()
+	engine := NewEngine(store)
+	policy := Policy{
+		SiteID:    "site-1",
+		RuleID:    "rule-1",
+		PolicyTag: "rule-1|force",
+		Mode:      model.CacheModeForceCache,
+		TTL:       time.Minute,
+		HasTTL:    true,
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "https://cdn.example.com/assets/app.js", nil)
+	fetch := func(_ context.Context, req *http.Request) (StoredResponse, error) {
+		return StoredResponse{
+			StatusCode: http.StatusOK,
+			Header: http.Header{
+				"Cache-Control": {"public, max-age=60"},
+				"Set-Cookie":    {"session=abc123; Path=/; HttpOnly"},
+			},
+			Body: []byte("body"),
+		}, nil
+	}
+
+	first, err := engine.Handle(context.Background(), req, policy, fetch)
+	if err != nil {
+		t.Fatalf("first handle: %v", err)
+	}
+	second, err := engine.Handle(context.Background(), req, policy, fetch)
+	if err != nil {
+		t.Fatalf("second handle: %v", err)
+	}
+
+	if first.Header.Get("Set-Cookie") == "" {
+		t.Fatalf("expected bypassed uncached response to keep Set-Cookie")
+	}
+	if second.State != StateMiss {
+		t.Fatalf("expected second request to miss because Set-Cookie response should not be cached, got %s", second.State)
 	}
 }
 
