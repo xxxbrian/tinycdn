@@ -68,6 +68,8 @@ function OverviewPage() {
   }, [period]);
 
   const topSitesByID = new Map((report.top_sites ?? []).map((site) => [site.site_id, site]));
+  const requestShare = (requests: number) =>
+    report.summary.requests > 0 ? requests / report.summary.requests : undefined;
 
   return (
     <ConsoleShell>
@@ -195,14 +197,17 @@ function OverviewPage() {
             label: item.path,
             requests: item.requests,
             edge_bytes: item.edge_bytes,
-            hit_ratio: item.hit_ratio,
+            hit_ratio: requestShare(item.requests),
           }))}
           emptyLabel="Path-level traffic will show up here once requests arrive."
         />
         <BreakdownCard
           title="Top hosts"
           description="Which host bindings currently drive the most volume."
-          items={report.top_hosts}
+          items={(report.top_hosts ?? []).map((item) => ({
+            ...item,
+            hit_ratio: requestShare(item.requests),
+          }))}
           emptyLabel="Host distribution will appear once traffic is present."
         />
         <Card>

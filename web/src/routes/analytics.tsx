@@ -26,6 +26,8 @@ function AnalyticsPage() {
   const initialReport = Route.useLoaderData();
   const [period, setPeriod] = useState<AnalyticsPeriod>("24h");
   const [report, setReport] = useState<AnalyticsReport>(initialReport);
+  const requestShare = (requests: number) =>
+    report.summary.requests > 0 ? requests / report.summary.requests : undefined;
 
   useEffect(() => {
     let cancelled = false;
@@ -90,7 +92,10 @@ function AnalyticsPage() {
         <BreakdownCard
           title="Top hosts"
           description="Host bindings ranked by request volume."
-          items={report.top_hosts}
+          items={(report.top_hosts ?? []).map((item) => ({
+            ...item,
+            hit_ratio: requestShare(item.requests),
+          }))}
           emptyLabel="No host traffic has been recorded yet."
         />
         <BreakdownCard
@@ -101,7 +106,7 @@ function AnalyticsPage() {
             label: item.site_name,
             requests: item.requests,
             edge_bytes: item.edge_bytes,
-            hit_ratio: item.hit_ratio,
+            hit_ratio: requestShare(item.requests),
           }))}
           emptyLabel="Site traffic ranking will appear once requests land."
         />
@@ -113,14 +118,17 @@ function AnalyticsPage() {
             label: item.path,
             requests: item.requests,
             edge_bytes: item.edge_bytes,
-            hit_ratio: item.hit_ratio,
+            hit_ratio: requestShare(item.requests),
           }))}
           emptyLabel="No path traffic has been recorded yet."
         />
         <BreakdownCard
           title="Rule pressure"
           description="Which cache rules are seeing the most requests."
-          items={report.top_rules}
+          items={(report.top_rules ?? []).map((item) => ({
+            ...item,
+            hit_ratio: requestShare(item.requests),
+          }))}
           emptyLabel="Rule-level analytics will appear after matching traffic arrives."
         />
       </div>

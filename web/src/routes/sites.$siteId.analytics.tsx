@@ -32,6 +32,8 @@ function SiteAnalyticsPage() {
   const initial = Route.useLoaderData();
   const [period, setPeriod] = useState<AnalyticsPeriod>("24h");
   const [report, setReport] = useState<AnalyticsReport>(initial.report);
+  const requestShare = (requests: number) =>
+    report.summary.requests > 0 ? requests / report.summary.requests : undefined;
 
   useEffect(() => {
     let cancelled = false;
@@ -101,7 +103,7 @@ function SiteAnalyticsPage() {
             label: item.path,
             requests: item.requests,
             edge_bytes: item.edge_bytes,
-            hit_ratio: item.hit_ratio,
+            hit_ratio: requestShare(item.requests),
           }))}
           emptyLabel="No path traffic has been recorded yet."
         />
@@ -109,11 +111,15 @@ function SiteAnalyticsPage() {
           title="Top hosts and rules"
           description="Host bindings and rule pressure for this site."
           items={[
-            ...(report.top_hosts ?? []),
+            ...(report.top_hosts ?? []).map((item) => ({
+              ...item,
+              hit_ratio: requestShare(item.requests),
+            })),
             ...(report.top_rules ?? []).map((item) => ({
               ...item,
               key: `rule:${item.key}`,
               label: item.key,
+              hit_ratio: requestShare(item.requests),
             })),
           ].slice(0, 8)}
           emptyLabel="Host and rule breakdowns will appear once requests match this site."
