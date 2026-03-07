@@ -79,15 +79,18 @@ func (r *Router) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		r.streamBypass(rw, req, site, rule, "request")
 		return
 	}
-	result, err := r.engine.Handle(req.Context(), req, policy, func(ctx context.Context, fetchReq *http.Request) (cache.StoredResponse, error) {
-		return r.fetcher.Fetch(ctx, fetchReq, site)
-	})
+
+	result, plan, err := r.engine.Start(req.Context(), req, policy)
 	if err != nil {
 		if errors.Is(err, ErrUpstreamResponseTooLarge) {
 			r.streamBypass(rw, req, site, rule, "object-too-large")
 			return
 		}
 		writeErrorResponse(rw, site, rule, err)
+		return
+	}
+	if plan != nil {
+		r.streamFill(rw, req, site, rule, plan)
 		return
 	}
 
@@ -127,6 +130,84 @@ func writeResult(rw http.ResponseWriter, req *http.Request, site *runtime.Compil
 	_, _ = rw.Write(result.Body)
 }
 
+func (r *Router) streamFill(rw http.ResponseWriter, req *http.Request, site *runtime.CompiledSite, rule *runtime.CompiledRule, plan *cache.FillPlan) {
+	resp, err := r.fetcher.Open(req.Context(), plan.PreparedRequest, site)
+	if err != nil {
+		if fallback, ok := r.engine.HandleFillError(plan, err); ok {
+			writeResult(rw, req, site, rule, fallback)
+			return
+		}
+		writeErrorResponse(rw, site, rule, err)
+		return
+	}
+	defer resp.Body.Close()
+
+	if responseTooLarge(resp, r.fetcher.maxCacheableObjectBytes) {
+		r.engine.AbortFill(plan, cache.StoredResponse{})
+		r.writeStreamedResponse(rw, req, site, rule, resp, cache.StateBypass, "TinyCDN; fwd=bypass; detail=object-too-large")
+		return
+	}
+
+	responseHeader := resp.Header.Clone()
+	httpx.StripHopByHopHeaders(responseHeader)
+
+	if err := os.MkdirAll(r.fetcher.tempDir, 0o755); err != nil {
+		r.engine.AbortFill(plan, cache.StoredResponse{})
+		writeErrorResponse(rw, site, rule, err)
+		return
+	}
+	tempFile, err := os.CreateTemp(r.fetcher.tempDir, "body-*")
+	if err != nil {
+		r.engine.AbortFill(plan, cache.StoredResponse{})
+		writeErrorResponse(rw, site, rule, err)
+		return
+	}
+	tempPath := tempFile.Name()
+	defer tempFile.Close()
+
+	header := rw.Header()
+	for key, values := range responseHeader {
+		for _, value := range values {
+			header.Add(key, value)
+		}
+	}
+	header.Set(headerTinyCDNCache, string(cache.StateMiss))
+	header.Set(headerTinyCDNSite, site.Source.ID)
+	header.Set(headerTinyCDNRule, rule.Source.ID)
+	header.Set(headerCacheStatus, r.engine.MissCacheStatus(plan))
+	if resp.ContentLength >= 0 {
+		header.Set("Content-Length", strconv.FormatInt(resp.ContentLength, 10))
+	}
+	rw.WriteHeader(resp.StatusCode)
+
+	var copyErr error
+	var copied int64
+	if req.Method == http.MethodHead {
+		copied, copyErr = io.Copy(tempFile, resp.Body)
+	} else {
+		copied, copyErr = io.Copy(io.MultiWriter(rw, tempFile), resp.Body)
+	}
+
+	stored := cache.StoredResponse{
+		StatusCode:    resp.StatusCode,
+		Header:        resp.Header.Clone(),
+		BodyPath:      tempPath,
+		ContentLength: contentLength(resp, copied),
+		CleanupPath:   true,
+	}
+
+	if closeErr := tempFile.Close(); copyErr == nil && closeErr != nil {
+		copyErr = closeErr
+	}
+	if copyErr != nil {
+		r.engine.AbortFill(plan, stored)
+		return
+	}
+	if err := r.engine.CompleteFill(req.Context(), plan, stored); err != nil {
+		return
+	}
+}
+
 func (r *Router) streamBypass(rw http.ResponseWriter, req *http.Request, site *runtime.CompiledSite, rule *runtime.CompiledRule, detail string) {
 	resp, err := r.fetcher.Open(req.Context(), req, site)
 	if err != nil {
@@ -135,6 +216,10 @@ func (r *Router) streamBypass(rw http.ResponseWriter, req *http.Request, site *r
 	}
 	defer resp.Body.Close()
 
+	r.writeStreamedResponse(rw, req, site, rule, resp, cache.StateBypass, "TinyCDN; fwd=bypass; detail="+detail)
+}
+
+func (r *Router) writeStreamedResponse(rw http.ResponseWriter, req *http.Request, site *runtime.CompiledSite, rule *runtime.CompiledRule, resp *http.Response, state cache.State, cacheStatus string) {
 	header := rw.Header()
 	responseHeader := resp.Header.Clone()
 	httpx.StripHopByHopHeaders(responseHeader)
@@ -143,10 +228,13 @@ func (r *Router) streamBypass(rw http.ResponseWriter, req *http.Request, site *r
 			header.Add(key, value)
 		}
 	}
-	header.Set(headerTinyCDNCache, string(cache.StateBypass))
+	header.Set(headerTinyCDNCache, string(state))
 	header.Set(headerTinyCDNSite, site.Source.ID)
 	header.Set(headerTinyCDNRule, rule.Source.ID)
-	header.Set(headerCacheStatus, "TinyCDN; fwd=bypass; detail="+detail)
+	header.Set(headerCacheStatus, cacheStatus)
+	if resp.ContentLength >= 0 {
+		header.Set("Content-Length", strconv.FormatInt(resp.ContentLength, 10))
+	}
 
 	rw.WriteHeader(resp.StatusCode)
 	if req.Method == http.MethodHead {

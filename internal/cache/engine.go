@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/sync/singleflight"
@@ -81,17 +82,35 @@ type Result struct {
 
 type FetchFunc func(context.Context, *http.Request) (StoredResponse, error)
 
+type FillPlan struct {
+	PreparedRequest *http.Request
+	baseKey         string
+	cacheKey        string
+	lookupErr       error
+	policy          Policy
+	originalMethod  string
+	fallbackEntry   Entry
+	hasFallback     bool
+}
+
+type inflightFill struct {
+	done chan struct{}
+}
+
 type Engine struct {
 	store   Store
 	now     func() time.Time
 	refresh singleflight.Group
 	fill    singleflight.Group
+	fillMu  sync.Mutex
+	fills   map[string]*inflightFill
 }
 
 func NewEngine(store Store) *Engine {
 	return &Engine{
 		store: store,
 		now:   func() time.Time { return time.Now().UTC() },
+		fills: map[string]*inflightFill{},
 	}
 }
 
@@ -169,6 +188,92 @@ func (e *Engine) Handle(ctx context.Context, req *http.Request, policy Policy, f
 	return buildResult(StateMiss, response, missCacheStatus(cacheKey, false, "")), nil
 }
 
+func (e *Engine) Start(ctx context.Context, req *http.Request, policy Policy) (Result, *FillPlan, error) {
+	preparedReq, requestBehavior := prepareRequest(req, policy)
+	if requestBehavior == StateBypass {
+		return Result{State: StateBypass}, nil, nil
+	}
+
+	baseKey := buildBaseCacheKey(policy.SiteID, cacheKeyMethod(req.Method), req.URL.Path, req.URL.RawQuery)
+
+	for {
+		cacheKey, entry, found, lookupErr := e.lookupEntry(ctx, baseKey, preparedReq.Header)
+		now := e.now()
+
+		if found && entry.PolicyTag == policy.PolicyTag {
+			if now.Before(entry.FreshUntil) && !shouldForceRefresh(req, policy) {
+				return entryResult(entry, StateHit, now), nil, nil
+			}
+
+			if policy.Optimistic && now.Before(entry.StaleUntil) {
+				return entryResult(entry, StateStale, now), nil, nil
+			}
+		}
+
+		fill, leader := e.claimFill(cacheKey)
+		if leader {
+			plan := &FillPlan{
+				PreparedRequest: preparedReq,
+				baseKey:         baseKey,
+				cacheKey:        cacheKey,
+				lookupErr:       lookupErr,
+				policy:          policy,
+				originalMethod:  req.Method,
+			}
+			if found {
+				plan.fallbackEntry = entry
+				plan.hasFallback = true
+			}
+			return Result{}, plan, nil
+		}
+
+		select {
+		case <-fill.done:
+		case <-ctx.Done():
+			return Result{}, nil, ctx.Err()
+		}
+	}
+}
+
+func (e *Engine) CompleteFill(ctx context.Context, plan *FillPlan, response StoredResponse) error {
+	defer e.releaseFill(plan.cacheKey)
+
+	decision := decideStore(e.now(), plan.policy, response)
+	if !decision.Store || !shouldStoreResponse(plan.originalMethod) {
+		return cleanupResponsePath(response)
+	}
+
+	response, err := e.persistResponseBody(ctx, response)
+	if err != nil {
+		return err
+	}
+	cacheKey := buildStorageKey(plan.baseKey, decision.VaryHeaders, plan.PreparedRequest.Header)
+	entry := buildEntry(e.now(), cacheKey, plan.policy, decision, response)
+	if err := e.storeResponse(ctx, plan.baseKey, entry, decision.VaryHeaders); err != nil {
+		response.CleanupPath = true
+		_ = cleanupResponsePath(response)
+		return err
+	}
+	return nil
+}
+
+func (e *Engine) AbortFill(plan *FillPlan, response StoredResponse) {
+	defer e.releaseFill(plan.cacheKey)
+	_ = cleanupResponsePath(response)
+}
+
+func (e *Engine) HandleFillError(plan *FillPlan, err error) (Result, bool) {
+	defer e.releaseFill(plan.cacheKey)
+	if plan.hasFallback && canServeStaleOnError(e.now(), plan.policy, plan.fallbackEntry) {
+		return entryResult(plan.fallbackEntry, StateStale, e.now()), true
+	}
+	return Result{}, false
+}
+
+func (e *Engine) MissCacheStatus(plan *FillPlan) string {
+	return missCacheStatus(plan.cacheKey, false, combineStatusDetails(plan.lookupErr))
+}
+
 func (e *Engine) refreshInBackground(ctx context.Context, cacheKey string, req *http.Request, policy Policy, fetch FetchFunc) {
 	_, _, _ = e.refresh.Do(cacheKey, func() (any, error) {
 		refreshCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
@@ -209,6 +314,29 @@ func (e *Engine) fetchWithCollapse(ctx context.Context, cacheKey string, req *ht
 		return StoredResponse{}, fmt.Errorf("unexpected collapsed response type %T", value)
 	}
 	return response, nil
+}
+
+func (e *Engine) claimFill(cacheKey string) (*inflightFill, bool) {
+	e.fillMu.Lock()
+	defer e.fillMu.Unlock()
+	if fill, ok := e.fills[cacheKey]; ok {
+		return fill, false
+	}
+	fill := &inflightFill{done: make(chan struct{})}
+	e.fills[cacheKey] = fill
+	return fill, true
+}
+
+func (e *Engine) releaseFill(cacheKey string) {
+	e.fillMu.Lock()
+	fill, ok := e.fills[cacheKey]
+	if ok {
+		delete(e.fills, cacheKey)
+	}
+	e.fillMu.Unlock()
+	if ok {
+		close(fill.done)
+	}
 }
 
 func (e *Engine) PurgeSite(ctx context.Context, siteID string) (int, error) {
@@ -793,4 +921,11 @@ func maxDuration(a, b time.Duration) time.Duration {
 		return b
 	}
 	return a
+}
+
+func cleanupResponsePath(response StoredResponse) error {
+	if !response.CleanupPath {
+		return nil
+	}
+	return removeBodyPath(response.BodyPath)
 }

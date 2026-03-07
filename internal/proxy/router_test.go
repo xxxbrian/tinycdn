@@ -4,7 +4,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
-	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -32,8 +31,8 @@ func TestRouterCacheHeadersAndHeadBehavior(t *testing.T) {
 	if got := first.Result().Header.Get(headerTinyCDNCache); got != "MISS" {
 		t.Fatalf("expected first request MISS, got %q", got)
 	}
-	if got := first.Result().Header.Get(headerCacheStatus); !strings.Contains(got, "stored") {
-		t.Fatalf("expected stored cache status, got %q", got)
+	if got := first.Result().Header.Get(headerCacheStatus); got != "TinyCDN; fwd=uri-miss; key=resp|site-1|GET|/assets/app.js" {
+		t.Fatalf("unexpected miss cache status, got %q", got)
 	}
 
 	second := httptest.NewRecorder()
@@ -216,8 +215,8 @@ func TestRouterStreamsOversizedObjectsWithoutCaching(t *testing.T) {
 	if got := second.Result().Header.Get(headerTinyCDNCache); got != "BYPASS" {
 		t.Fatalf("expected repeated oversized response to bypass, got %q", got)
 	}
-	if got := upstreamHits.Load(); got != 4 {
-		t.Fatalf("expected two fetch attempts plus two stream retries for oversized object, got %d", got)
+	if got := upstreamHits.Load(); got != 2 {
+		t.Fatalf("expected one upstream fetch per oversized bypass request, got %d", got)
 	}
 }
 
