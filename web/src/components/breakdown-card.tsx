@@ -20,7 +20,7 @@ export function BreakdownCard({
   }>;
   emptyLabel: string;
 }) {
-  const max = Math.max(...items.map((item) => item.requests), 0);
+  const total = items.reduce((sum, item) => sum + item.requests, 0);
 
   return (
     <Card>
@@ -51,13 +51,13 @@ export function BreakdownCard({
                     ) : null}
                   </div>
                 </div>
-                <BarChart3 className="mt-0.5 size-4 shrink-0 text-[var(--chart-2)]" />
+                <BarChart3 className="mt-0.5 size-4 shrink-0 text-primary/70" />
               </div>
               <div className="mt-3 h-2 rounded-full bg-muted/80 ring-1 ring-border/70">
                 <div
-                  className="h-2 rounded-full bg-[var(--chart-2)]"
+                  className="h-2 rounded-full bg-primary/75"
                   style={{
-                    width: `${max === 0 ? 0 : (item.requests / max) * 100}%`,
+                    width: `${total === 0 ? 0 : (item.requests / total) * 100}%`,
                   }}
                 />
               </div>
