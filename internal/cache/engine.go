@@ -91,6 +91,15 @@ type FillPlan struct {
 	originalMethod  string
 	fallbackEntry   Entry
 	hasFallback     bool
+	revalidate      bool
+}
+
+func (p *FillPlan) Request(ctx context.Context) *http.Request {
+	req := p.PreparedRequest.Clone(ctx)
+	if p.revalidate && p.hasFallback {
+		req = applyRevalidationHeaders(req, p.fallbackEntry)
+	}
+	return req
 }
 
 type inflightFill struct {
@@ -101,7 +110,6 @@ type Engine struct {
 	store   Store
 	now     func() time.Time
 	refresh singleflight.Group
-	fill    singleflight.Group
 	fillMu  sync.Mutex
 	fills   map[string]*inflightFill
 }
@@ -142,50 +150,46 @@ func (e *Engine) Handle(ctx context.Context, req *http.Request, policy Policy, f
 		return buildResult(StateBypass, response, bypassCacheStatus("request")), nil
 	}
 
-	keyMethod := cacheKeyMethod(req.Method)
-	baseKey := buildBaseCacheKey(policy.SiteID, keyMethod, req.URL.Path, req.URL.RawQuery)
-	cacheKey, entry, found, lookupErr := e.lookupEntry(ctx, baseKey, preparedReq.Header)
-	now := e.now()
-
-	if found && entry.PolicyTag == policy.PolicyTag {
-		if now.Before(entry.FreshUntil) && !shouldForceRefresh(req, policy) {
-			return entryResult(entry, StateHit, now), nil
-		}
-
-		if policy.Optimistic && now.Before(entry.StaleUntil) {
-			go e.refreshInBackground(context.Background(), cacheKey, preparedReq, policy, fetch)
-			return entryResult(entry, StateStale, now), nil
-		}
+	result, plan, err := e.Start(ctx, req, policy)
+	if err != nil {
+		return Result{}, err
+	}
+	if plan == nil {
+		return result, nil
+	}
+	if result.State == StateStale {
+		go func() {
+			refreshCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			response, err := fetch(refreshCtx, plan.Request(refreshCtx))
+			if err != nil {
+				_, _ = e.HandleFillError(plan, err)
+				return
+			}
+			if _, ok, err := e.RevalidatedResult(refreshCtx, plan, response); err != nil || ok {
+				return
+			}
+			_ = e.CompleteFill(refreshCtx, plan, response)
+		}()
+		return result, nil
 	}
 
-	response, err := e.fetchWithCollapse(ctx, cacheKey, preparedReq, fetch)
+	response, err := fetch(ctx, plan.Request(ctx))
 	if err != nil {
-		if found && canServeStaleOnError(now, policy, entry) {
-			return entryResult(entry, StateStale, now), nil
+		if fallback, ok := e.HandleFillError(plan, err); ok {
+			return fallback, nil
 		}
 		return Result{}, err
 	}
-
-	decision := decideStore(now, policy, response)
-	if decision.Store && shouldStoreResponse(req.Method) {
-		response, err = e.persistResponseBody(ctx, response)
-		if err != nil {
-			return Result{}, err
-		}
-		cacheKey = buildStorageKey(baseKey, decision.VaryHeaders, preparedReq.Header)
-		entry := buildEntry(now, cacheKey, policy, decision, response)
-		if err := e.storeResponse(ctx, baseKey, entry, decision.VaryHeaders); err != nil {
-			response.CleanupPath = true
-			return buildResult(StateMiss, response, missCacheStatus(cacheKey, false, combineStatusDetails(lookupErr, "STORE_ERROR"))), nil
-		}
-		response.CleanupPath = false
-		return buildResult(StateMiss, response, missCacheStatus(cacheKey, true, combineStatusDetails(lookupErr))), nil
+	if revalidated, ok, err := e.RevalidatedResult(ctx, plan, response); err != nil {
+		return Result{}, err
+	} else if ok {
+		return revalidated, nil
 	}
-
-	if lookupErr != nil {
-		return buildResult(StateMiss, response, missCacheStatus(cacheKey, false, combineStatusDetails(lookupErr))), nil
+	if err := e.CompleteFill(ctx, plan, response); err != nil {
+		return buildResult(StateMiss, response, missCacheStatus(plan.cacheKey, false, combineStatusDetails(plan.lookupErr, "STORE_ERROR"))), nil
 	}
-	return buildResult(StateMiss, response, missCacheStatus(cacheKey, false, "")), nil
+	return buildResult(StateMiss, response, missCacheStatus(plan.cacheKey, false, combineStatusDetails(plan.lookupErr))), nil
 }
 
 func (e *Engine) Start(ctx context.Context, req *http.Request, policy Policy) (Result, *FillPlan, error) {
@@ -206,6 +210,25 @@ func (e *Engine) Start(ctx context.Context, req *http.Request, policy Policy) (R
 			}
 
 			if policy.Optimistic && now.Before(entry.StaleUntil) {
+				fill, leader := e.claimFill(cacheKey)
+				if leader {
+					_ = fill
+					plan := &FillPlan{
+						PreparedRequest: preparedReq,
+						baseKey:         baseKey,
+						cacheKey:        cacheKey,
+						lookupErr:       lookupErr,
+						policy:          policy,
+						originalMethod:  req.Method,
+						fallbackEntry:   entry,
+						hasFallback:     true,
+						revalidate:      canRevalidate(policy, entry),
+					}
+					if plan.revalidate {
+						plan.PreparedRequest = applyRevalidationHeaders(plan.PreparedRequest, entry)
+					}
+					return entryResult(entry, StateStale, now), plan, nil
+				}
 				return entryResult(entry, StateStale, now), nil, nil
 			}
 		}
@@ -223,6 +246,10 @@ func (e *Engine) Start(ctx context.Context, req *http.Request, policy Policy) (R
 			if found {
 				plan.fallbackEntry = entry
 				plan.hasFallback = true
+				plan.revalidate = canRevalidate(policy, entry)
+				if plan.revalidate {
+					plan.PreparedRequest = applyRevalidationHeaders(plan.PreparedRequest, entry)
+				}
 			}
 			return Result{}, plan, nil
 		}
@@ -237,6 +264,11 @@ func (e *Engine) Start(ctx context.Context, req *http.Request, policy Policy) (R
 
 func (e *Engine) CompleteFill(ctx context.Context, plan *FillPlan, response StoredResponse) error {
 	defer e.releaseFill(plan.cacheKey)
+
+	if plan.revalidate && response.StatusCode == http.StatusNotModified && plan.hasFallback {
+		_, err := e.completeRevalidation(ctx, plan.baseKey, plan.PreparedRequest.Header, plan.policy, plan.fallbackEntry, response)
+		return err
+	}
 
 	decision := decideStore(e.now(), plan.policy, response)
 	if !decision.Store || !shouldStoreResponse(plan.originalMethod) {
@@ -274,13 +306,36 @@ func (e *Engine) MissCacheStatus(plan *FillPlan) string {
 	return missCacheStatus(plan.cacheKey, false, combineStatusDetails(plan.lookupErr))
 }
 
-func (e *Engine) refreshInBackground(ctx context.Context, cacheKey string, req *http.Request, policy Policy, fetch FetchFunc) {
+func (e *Engine) RevalidatedResult(ctx context.Context, plan *FillPlan, response StoredResponse) (Result, bool, error) {
+	if !(plan.revalidate && response.StatusCode == http.StatusNotModified && plan.hasFallback) {
+		return Result{}, false, nil
+	}
+	defer e.releaseFill(plan.cacheKey)
+	result, err := e.completeRevalidation(ctx, plan.baseKey, plan.PreparedRequest.Header, plan.policy, plan.fallbackEntry, response)
+	if err != nil {
+		return Result{}, false, err
+	}
+	return result, true, nil
+}
+
+func (e *Engine) refreshInBackground(ctx context.Context, cacheKey string, req *http.Request, policy Policy, entry Entry, fetch FetchFunc) {
 	_, _, _ = e.refresh.Do(cacheKey, func() (any, error) {
 		refreshCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		defer cancel()
 
-		response, err := fetch(refreshCtx, req.Clone(refreshCtx))
+		refreshReq := req.Clone(refreshCtx)
+		if canRevalidate(policy, entry) {
+			refreshReq = applyRevalidationHeaders(refreshReq, entry)
+		}
+
+		response, err := fetch(refreshCtx, refreshReq)
 		if err != nil {
+			return nil, err
+		}
+
+		baseKey := buildBaseCacheKey(policy.SiteID, cacheKeyMethod(req.Method), req.URL.Path, req.URL.RawQuery)
+		if response.StatusCode == http.StatusNotModified {
+			_, err := e.completeRevalidation(refreshCtx, baseKey, refreshReq.Header, policy, entry, response)
 			return nil, err
 		}
 
@@ -295,25 +350,10 @@ func (e *Engine) refreshInBackground(ctx context.Context, cacheKey string, req *
 		}
 
 		now := e.now()
-		baseKey := buildBaseCacheKey(policy.SiteID, cacheKeyMethod(req.Method), req.URL.Path, req.URL.RawQuery)
 		nextKey := buildStorageKey(baseKey, decision.VaryHeaders, req.Header)
 		entry := buildEntry(now, nextKey, policy, decision, response)
 		return nil, e.storeResponse(refreshCtx, baseKey, entry, decision.VaryHeaders)
 	})
-}
-
-func (e *Engine) fetchWithCollapse(ctx context.Context, cacheKey string, req *http.Request, fetch FetchFunc) (StoredResponse, error) {
-	value, err, _ := e.fill.Do(cacheKey, func() (any, error) {
-		return fetch(ctx, req)
-	})
-	if err != nil {
-		return StoredResponse{}, err
-	}
-	response, ok := value.(StoredResponse)
-	if !ok {
-		return StoredResponse{}, fmt.Errorf("unexpected collapsed response type %T", value)
-	}
-	return response, nil
 }
 
 func (e *Engine) claimFill(cacheKey string) (*inflightFill, bool) {
@@ -399,7 +439,6 @@ func (e *Engine) storeResponse(ctx context.Context, baseKey string, entry Entry,
 			return err
 		}
 		_ = e.store.Delete(ctx, varyKey(baseKey))
-		_ = e.store.Delete(ctx, responseKey(baseKey))
 		return e.store.PutEntry(ctx, responseKey(baseKey), entry)
 	}
 
@@ -408,10 +447,7 @@ func (e *Engine) storeResponse(ctx context.Context, baseKey string, entry Entry,
 			return err
 		}
 	}
-	if err := e.store.Delete(ctx, responseKey(baseKey)); err != nil {
-		return err
-	}
-	_ = e.store.Delete(ctx, entry.Key)
+	_ = e.store.Delete(ctx, responseKey(baseKey))
 	if err := e.store.PutVary(ctx, varyKey(baseKey), VarySpec{Headers: varyHeaders}); err != nil {
 		return err
 	}
@@ -456,6 +492,9 @@ func buildEntry(now time.Time, cacheKey string, policy Policy, decision storeDec
 	}
 	if entry.Response.ContentLength == 0 && entry.Response.Body != nil {
 		entry.Response.ContentLength = int64(len(entry.Response.Body))
+	}
+	if !entry.InvalidAt.After(entry.StoredAt) && hasRevalidationValidators(response.Header) {
+		entry.InvalidAt = entry.StoredAt.Add(DefaultManagedTTL)
 	}
 	if entry.InvalidAt.Before(entry.StoredAt) {
 		entry.InvalidAt = entry.StoredAt
@@ -506,6 +545,9 @@ func decideStore(now time.Time, policy Policy, response StoredResponse) storeDec
 		}
 
 		staleIfError := directives.staleIfError
+		if ttl == 0 && staleWindow == 0 && staleIfError == 0 && !hasRevalidationValidators(response.Header) {
+			return storeDecision{}
+		}
 		return storeDecision{
 			Store:        true,
 			TTL:          ttl,
@@ -928,4 +970,67 @@ func cleanupResponsePath(response StoredResponse) error {
 		return nil
 	}
 	return removeBodyPath(response.BodyPath)
+}
+
+func canRevalidate(policy Policy, entry Entry) bool {
+	if policy.Mode != model.CacheModeFollowOrigin {
+		return false
+	}
+	return hasRevalidationValidators(entry.Response.Header)
+}
+
+func hasRevalidationValidators(header http.Header) bool {
+	return header.Get("ETag") != "" || header.Get("Last-Modified") != ""
+}
+
+func applyRevalidationHeaders(req *http.Request, entry Entry) *http.Request {
+	cloned := req.Clone(req.Context())
+	cloned.Header = req.Header.Clone()
+	if etag := entry.Response.Header.Get("ETag"); etag != "" {
+		cloned.Header.Set("If-None-Match", etag)
+	}
+	if lastModified := entry.Response.Header.Get("Last-Modified"); lastModified != "" {
+		cloned.Header.Set("If-Modified-Since", lastModified)
+	}
+	return cloned
+}
+
+func mergeRevalidatedHeader(stored http.Header, revalidated http.Header) http.Header {
+	merged := sanitizeStoredHeader(stored)
+	updates := sanitizeStoredHeader(revalidated)
+	for key, values := range updates {
+		merged.Del(key)
+		for _, value := range values {
+			merged.Add(key, value)
+		}
+	}
+	return merged
+}
+
+func (e *Engine) completeRevalidation(ctx context.Context, baseKey string, requestHeader http.Header, policy Policy, entry Entry, response StoredResponse) (Result, error) {
+	mergedHeader := mergeRevalidatedHeader(entry.Response.Header, response.Header)
+	effective := StoredResponse{
+		StatusCode:    entry.Response.StatusCode,
+		Header:        mergedHeader,
+		Body:          append([]byte(nil), entry.Response.Body...),
+		BodyPath:      entry.Response.BodyPath,
+		ContentLength: entry.Response.ContentLength,
+	}
+	decision := decideStore(e.now(), policy, effective)
+	if !decision.Store {
+		result := entryResult(entry, StateHit, e.now())
+		result.CacheStatus = hitCacheStatus(entry, StateHit, e.now()) + "; detail=REVALIDATED"
+		return result, nil
+	}
+
+	updatedKey := buildStorageKey(baseKey, decision.VaryHeaders, requestHeader)
+	updated := buildEntry(e.now(), updatedKey, policy, decision, effective)
+	if err := e.storeResponse(ctx, baseKey, updated, decision.VaryHeaders); err != nil {
+		result := entryResult(updated, StateHit, e.now())
+		result.CacheStatus = hitCacheStatus(updated, StateHit, e.now()) + "; detail=REVALIDATED,STORE_ERROR"
+		return result, nil
+	}
+	result := entryResult(updated, StateHit, e.now())
+	result.CacheStatus = hitCacheStatus(updated, StateHit, e.now()) + "; detail=REVALIDATED"
+	return result, nil
 }

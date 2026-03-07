@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -104,6 +105,66 @@ func TestRouterHeadColdMissFetchesGetAndPreservesLength(t *testing.T) {
 	}
 	if got := upstreamHits.Load(); got != 1 {
 		t.Fatalf("expected one upstream fetch, got %d", got)
+	}
+}
+
+func TestRouterServesCachedBodyAfterOriginRevalidation(t *testing.T) {
+	var upstreamHits atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		hit := upstreamHits.Add(1)
+		switch hit {
+		case 1:
+			rw.Header().Set("Cache-Control", "public, no-cache")
+			rw.Header().Set("ETag", `"v1"`)
+			rw.WriteHeader(http.StatusOK)
+			_, _ = rw.Write([]byte("payload"))
+		case 2:
+			if got := req.Header.Get("If-None-Match"); got != `"v1"` {
+				t.Fatalf("expected edge revalidation header, got %q", got)
+			}
+			rw.Header().Set("Cache-Control", "public, max-age=60")
+			rw.Header().Set("ETag", `"v1"`)
+			rw.WriteHeader(http.StatusNotModified)
+		default:
+			t.Fatalf("unexpected third upstream fetch")
+		}
+	}))
+	defer upstream.Close()
+
+	router := newTestRouter(t, newFollowOriginSnapshot(t, upstream.URL))
+	defer router.Close()
+
+	req := httptest.NewRequest(http.MethodGet, "http://cdn.example.com/assets/app.js", nil)
+	req.Host = "cdn.example.com"
+
+	first := httptest.NewRecorder()
+	router.ServeHTTP(first, req)
+	if got := first.Result().Header.Get(headerTinyCDNCache); got != "MISS" {
+		t.Fatalf("expected first request MISS, got %q", got)
+	}
+
+	second := httptest.NewRecorder()
+	router.ServeHTTP(second, req)
+	if got := second.Result().StatusCode; got != http.StatusOK {
+		t.Fatalf("expected revalidated request to return cached 200, got %d", got)
+	}
+	if got := second.Result().Header.Get(headerTinyCDNCache); got != "HIT" {
+		t.Fatalf("expected revalidated request HIT, got %q", got)
+	}
+	if !strings.Contains(second.Result().Header.Get(headerCacheStatus), "detail=REVALIDATED") {
+		t.Fatalf("expected revalidated cache status, got %q", second.Result().Header.Get(headerCacheStatus))
+	}
+	if second.Body.String() != "payload" {
+		t.Fatalf("expected cached body after 304 revalidation, got %q", second.Body.String())
+	}
+
+	third := httptest.NewRecorder()
+	router.ServeHTTP(third, req)
+	if got := third.Result().Header.Get(headerTinyCDNCache); got != "HIT" {
+		t.Fatalf("expected third request HIT, got %q", got)
+	}
+	if got := upstreamHits.Load(); got != 2 {
+		t.Fatalf("expected two upstream fetches, got %d", got)
 	}
 }
 
@@ -291,6 +352,51 @@ func newTestSnapshot(t *testing.T, upstreamURL string) *runtime.Snapshot {
 							Cache: model.CacheAction{
 								Mode: model.CacheModeForceCache,
 								TTL:  "5m",
+							},
+						},
+					},
+					model.NewDefaultRule(),
+				},
+			},
+		},
+	}
+
+	snapshot, err := runtime.Compile(cfg)
+	if err != nil {
+		t.Fatalf("compile runtime: %v", err)
+	}
+	return snapshot
+}
+
+func newFollowOriginSnapshot(t *testing.T, upstreamURL string) *runtime.Snapshot {
+	t.Helper()
+	cfg := model.AppConfig{
+		Sites: []model.Site{
+			{
+				ID:      "site-1",
+				Name:    "Site 1",
+				Enabled: true,
+				Hosts:   []string{"cdn.example.com"},
+				Upstream: model.Upstream{
+					URL: upstreamURL,
+				},
+				Rules: []model.Rule{
+					{
+						ID:      "rule-1",
+						Name:    "Assets",
+						Enabled: true,
+						Match: model.MatchSpec{
+							Clauses: []model.MatchClause{
+								{
+									Field:    model.MatchFieldURIPath,
+									Operator: model.MatchOperatorStartsWith,
+									Value:    "/assets/",
+								},
+							},
+						},
+						Action: model.RuleAction{
+							Cache: model.CacheAction{
+								Mode: model.CacheModeFollowOrigin,
 							},
 						},
 					},

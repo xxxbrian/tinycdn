@@ -165,6 +165,10 @@ func TestEngineForceCacheMissThenHit(t *testing.T) {
 	if first.State != StateMiss {
 		t.Fatalf("expected first request to miss, got %s", first.State)
 	}
+	_, found, err := store.GetEntry(context.Background(), responseKey(buildBaseCacheKey("site-1", http.MethodGet, "/assets/app.js", "")))
+	if err != nil || !found {
+		t.Fatalf("expected first response to be stored, found=%t err=%v", found, err)
+	}
 
 	second, err := engine.Handle(context.Background(), req, policy, fetch)
 	if err != nil {
@@ -388,6 +392,108 @@ func TestEngineFollowOriginRespectsCacheControl(t *testing.T) {
 	}
 	if fetches != 1 {
 		t.Fatalf("expected one upstream fetch, got %d", fetches)
+	}
+}
+
+func TestEngineFollowOriginRevalidatesWithETag(t *testing.T) {
+	store := newMemoryStore()
+	engine := NewEngine(store)
+	now := time.Date(2026, time.March, 7, 0, 0, 0, 0, time.UTC)
+	engine.now = func() time.Time { return now }
+
+	policy := Policy{
+		SiteID:    "site-1",
+		RuleID:    "rule-1",
+		PolicyTag: "rule-1|origin",
+		Mode:      model.CacheModeFollowOrigin,
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "https://cdn.example.com/assets/app.js", nil)
+	fetches := 0
+	fetch := func(_ context.Context, req *http.Request) (StoredResponse, error) {
+		fetches++
+		switch fetches {
+		case 1:
+			return StoredResponse{
+				StatusCode: http.StatusOK,
+				Header: http.Header{
+					"Cache-Control": {"public, no-cache"},
+					"Etag":          {`"v1"`},
+				},
+				Body: []byte("payload"),
+			}, nil
+		case 2:
+			if got := req.Header.Get("If-None-Match"); got != `"v1"` {
+				t.Fatalf("expected conditional revalidation header, got %q", got)
+			}
+			return StoredResponse{
+				StatusCode: http.StatusNotModified,
+				Header: http.Header{
+					"Cache-Control": {"public, max-age=60"},
+					"Etag":          {`"v1"`},
+				},
+			}, nil
+		default:
+			return StoredResponse{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Cache-Control": {"public, max-age=60"}},
+				Body:       []byte("unexpected"),
+			}, nil
+		}
+	}
+
+	first, err := engine.Handle(context.Background(), req, policy, fetch)
+	if err != nil {
+		t.Fatalf("first handle: %v", err)
+	}
+	if first.State != StateMiss {
+		t.Fatalf("expected first request to miss, got %s", first.State)
+	}
+	stored, found, err := store.GetEntry(context.Background(), responseKey(buildBaseCacheKey("site-1", http.MethodGet, "/assets/app.js", "")))
+	if err != nil || !found {
+		t.Fatalf("expected first response to be stored, found=%t err=%v", found, err)
+	}
+	if got := stored.Response.Header.Get("ETag"); got != `"v1"` {
+		t.Fatalf("expected stored validator to be preserved, got %q", got)
+	}
+	startResult, plan, err := engine.Start(context.Background(), req, policy)
+	if err != nil {
+		t.Fatalf("start before revalidation: %v", err)
+	}
+	if startResult.State != "" {
+		t.Fatalf("expected stale follow_origin revalidation to require fill plan, got state %s", startResult.State)
+	}
+	if plan == nil {
+		t.Fatalf("expected fill plan for revalidation")
+	}
+	if got := plan.Request(context.Background()).Header.Get("If-None-Match"); got != `"v1"` {
+		t.Fatalf("expected plan request to carry conditional revalidation header, got %q", got)
+	}
+	engine.releaseFill(plan.cacheKey)
+
+	second, err := engine.Handle(context.Background(), req, policy, fetch)
+	if err != nil {
+		t.Fatalf("second handle: %v", err)
+	}
+	if second.State != StateHit {
+		t.Fatalf("expected revalidated response to return HIT, got %s", second.State)
+	}
+	if string(second.Body) != "payload" {
+		t.Fatalf("expected cached body after revalidation, got %q", string(second.Body))
+	}
+	if !strings.Contains(second.CacheStatus, "detail=REVALIDATED") {
+		t.Fatalf("expected revalidated cache status, got %q", second.CacheStatus)
+	}
+
+	third, err := engine.Handle(context.Background(), req, policy, fetch)
+	if err != nil {
+		t.Fatalf("third handle: %v", err)
+	}
+	if third.State != StateHit {
+		t.Fatalf("expected post-revalidation request to hit, got %s", third.State)
+	}
+	if fetches != 2 {
+		t.Fatalf("expected two upstream fetches, got %d", fetches)
 	}
 }
 
@@ -927,9 +1033,9 @@ func TestEngineFollowOriginRequestAndResponseMatrix(t *testing.T) {
 			requestNoCache: true,
 		},
 		{
-			name:        "response no-cache stores but revalidates every time",
+			name:        "response no-cache without validators does not store",
 			header:      http.Header{"Cache-Control": {"public, no-cache"}},
-			wantStored:  true,
+			wantStored:  false,
 			wantSecond:  StateMiss,
 			wantFetches: 2,
 		},

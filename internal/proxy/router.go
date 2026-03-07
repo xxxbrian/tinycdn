@@ -90,11 +90,36 @@ func (r *Router) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		return
 	}
 	if plan != nil {
+		if result.State == cache.StateStale {
+			go r.fillInBackground(site, plan)
+			writeResult(rw, req, site, rule, result)
+			return
+		}
 		r.streamFill(rw, req, site, rule, plan)
 		return
 	}
 
 	writeResult(rw, req, site, rule, result)
+}
+
+func (r *Router) fillInBackground(site *runtime.CompiledSite, plan *cache.FillPlan) {
+	ctx, cancel := context.WithTimeout(context.Background(), defaultUpstreamTimeout)
+	defer cancel()
+
+	response, err := r.fetcher.Fetch(ctx, plan.Request(ctx), site)
+	if err != nil {
+		_, _ = r.engine.HandleFillError(plan, err)
+		return
+	}
+	if _, ok, err := r.engine.RevalidatedResult(ctx, plan, response); err != nil {
+		return
+	} else if ok {
+		if response.CleanupPath {
+			_ = os.Remove(response.BodyPath)
+		}
+		return
+	}
+	_ = r.engine.CompleteFill(ctx, plan, response)
 }
 
 func writeResult(rw http.ResponseWriter, req *http.Request, site *runtime.CompiledSite, rule *runtime.CompiledRule, result cache.Result) {
@@ -108,7 +133,9 @@ func writeResult(rw http.ResponseWriter, req *http.Request, site *runtime.Compil
 	header.Set(headerTinyCDNSite, site.Source.ID)
 	header.Set(headerTinyCDNRule, rule.Source.ID)
 	header.Set(headerCacheStatus, result.CacheStatus)
-	header.Set("Content-Length", strconv.FormatInt(result.ContentLength, 10))
+	if result.ContentLength >= 0 {
+		header.Set("Content-Length", strconv.FormatInt(result.ContentLength, 10))
+	}
 
 	rw.WriteHeader(result.StatusCode)
 	if result.CleanupPath {
@@ -131,7 +158,7 @@ func writeResult(rw http.ResponseWriter, req *http.Request, site *runtime.Compil
 }
 
 func (r *Router) streamFill(rw http.ResponseWriter, req *http.Request, site *runtime.CompiledSite, rule *runtime.CompiledRule, plan *cache.FillPlan) {
-	resp, err := r.fetcher.Open(req.Context(), plan.PreparedRequest, site)
+	resp, err := r.fetcher.Open(req.Context(), plan.Request(req.Context()), site)
 	if err != nil {
 		if fallback, ok := r.engine.HandleFillError(plan, err); ok {
 			writeResult(rw, req, site, rule, fallback)
@@ -141,6 +168,17 @@ func (r *Router) streamFill(rw http.ResponseWriter, req *http.Request, site *run
 		return
 	}
 	defer resp.Body.Close()
+
+	if result, ok, err := r.engine.RevalidatedResult(req.Context(), plan, cache.StoredResponse{
+		StatusCode: resp.StatusCode,
+		Header:     resp.Header.Clone(),
+	}); err != nil {
+		writeErrorResponse(rw, site, rule, err)
+		return
+	} else if ok {
+		writeResult(rw, req, site, rule, result)
+		return
+	}
 
 	if responseTooLarge(resp, r.fetcher.maxCacheableObjectBytes) {
 		r.engine.AbortFill(plan, cache.StoredResponse{})
