@@ -98,6 +98,18 @@ func (s *memoryStore) PutChunk(_ context.Context, key string, chunk ChunkEntry) 
 	return nil
 }
 
+func (s *memoryStore) TouchChunkPrefix(_ context.Context, prefix string, invalidAt time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for key, chunk := range s.chunks {
+		if strings.HasPrefix(key, prefix) {
+			chunk.InvalidAt = invalidAt
+			s.chunks[key] = chunk
+		}
+	}
+	return nil
+}
+
 func (s *memoryStore) ImportBody(_ context.Context, tempPath string) (string, error) {
 	return tempPath, nil
 }
@@ -184,6 +196,10 @@ func (s *errorStore) GetChunk(_ context.Context, _ string) (ChunkEntry, bool, er
 }
 
 func (s *errorStore) PutChunk(_ context.Context, _ string, _ ChunkEntry) error {
+	return s.putErr
+}
+
+func (s *errorStore) TouchChunkPrefix(_ context.Context, _ string, _ time.Time) error {
 	return s.putErr
 }
 

@@ -90,7 +90,21 @@ func (c *RangeCache) Handle(ctx context.Context, req *http.Request, policy Polic
 	}
 
 	now := c.now()
+	revalidatedNow := false
 	if found && object.PolicyTag == policy.PolicyTag {
+		if !now.Before(object.FreshUntil) && canRevalidateChunkObject(policy, object) {
+			revalidatedObject, revalidatedKey, renewed, renewedErr := c.revalidateChunkObject(ctx, baseKey, preparedReq, policy, objectKey, object, fetch)
+			if renewedErr != nil {
+				return RangeResult{}, renewedErr
+			}
+			if renewed {
+				object = revalidatedObject
+				objectKey = revalidatedKey
+				found = true
+				now = c.now()
+				revalidatedNow = true
+			}
+		}
 		resolved, valid := resolveByteRange(requested, object.TotalLength)
 		if !valid {
 			return c.rangeNotSatisfiable(object, requested), nil
@@ -98,6 +112,9 @@ func (c *RangeCache) Handle(ctx context.Context, req *http.Request, policy Polic
 		parts, complete, err := c.loadChunkParts(ctx, objectKey, requestedChunkIndexes(resolved, object.ChunkSize), resolved, object.ChunkSize, false)
 		if err != nil {
 			return RangeResult{}, err
+		}
+		if complete && revalidatedNow {
+			return buildChunkRangeResult(object, parts, resolved, StateHit, hitChunkCacheStatus(object, StateHit, now, true)), nil
 		}
 		if complete && now.Before(object.FreshUntil) {
 			return buildChunkRangeResult(object, parts, resolved, StateHit, hitChunkCacheStatus(object, StateHit, now, false)), nil
@@ -262,6 +279,35 @@ func (c *RangeCache) fillRange(ctx context.Context, baseKey string, req *http.Re
 	object := currentObject
 	objectKey := initialObjectKey
 	partsByIndex := map[int64]RangePart{}
+	revalidatedNow := false
+
+	if found && object.PolicyTag == policy.PolicyTag && !c.now().Before(object.FreshUntil) && canRevalidateChunkObject(policy, object) {
+		revalidatedObject, revalidatedKey, renewed, renewedErr := c.revalidateChunkObject(ctx, baseKey, req, policy, objectKey, object, fetch)
+		if renewedErr != nil {
+			return RangeResult{}, renewedErr
+		}
+		if renewed {
+			object = revalidatedObject
+			objectKey = revalidatedKey
+			found = true
+			totalLength = object.TotalLength
+			revalidatedNow = true
+		}
+	}
+
+	if found && revalidatedNow && totalLength > 0 {
+		resolved, valid := resolveByteRange(requested, totalLength)
+		if !valid {
+			return c.rangeNotSatisfiable(object, requested), nil
+		}
+		parts, complete, err := c.loadChunkParts(ctx, objectKey, requestedChunkIndexes(resolved, object.ChunkSize), resolved, object.ChunkSize, false)
+		if err != nil {
+			return RangeResult{}, err
+		}
+		if complete {
+			return buildChunkRangeResult(object, parts, resolved, StateHit, hitChunkCacheStatus(object, StateHit, c.now(), true)), nil
+		}
+	}
 
 	for i, chunkIndex := range chunkIndexes {
 		if found && object.PolicyTag == policy.PolicyTag {
@@ -476,6 +522,102 @@ func (c *RangeCache) fetchChunk(ctx context.Context, req *http.Request, policy P
 	)
 	object := buildChunkObject(c.now(), objectKey, policy, decision, response, contentRange.Total, c.chunkSize)
 	return response, object, objectKey, decision, false, nil
+}
+
+func (c *RangeCache) revalidateChunkObject(ctx context.Context, baseKey string, req *http.Request, policy Policy, objectKey string, object ChunkObject, fetch FetchFunc) (ChunkObject, string, bool, error) {
+	revalidateReq := req.Clone(ctx)
+	revalidateReq.Method = http.MethodHead
+	revalidateReq.Header = req.Header.Clone()
+	revalidateReq.Header.Del("Range")
+	revalidateReq.Header.Set("Accept-Encoding", "identity")
+	if etag := object.Header.Get("ETag"); etag != "" {
+		revalidateReq.Header.Set("If-None-Match", etag)
+	}
+	if lastModified := object.Header.Get("Last-Modified"); lastModified != "" {
+		revalidateReq.Header.Set("If-Modified-Since", lastModified)
+	}
+
+	response, err := fetch(ctx, revalidateReq)
+	if err != nil {
+		return ChunkObject{}, "", false, err
+	}
+	if response.CleanupPath {
+		_ = cleanupResponsePath(response)
+	}
+
+	switch response.StatusCode {
+	case http.StatusNotModified:
+		updated, updatedKey, sameVersion, err := c.renewChunkObject(ctx, baseKey, req.Header, policy, objectKey, object, mergeRevalidatedHeader(object.Header, response.Header), parseAge(response.Header.Get("Age")))
+		if err != nil {
+			return ChunkObject{}, "", false, err
+		}
+		if sameVersion {
+			if err := c.store.TouchChunkPrefix(ctx, rangeChunkPrefix(updatedKey), updated.InvalidAt); err != nil {
+				return ChunkObject{}, "", false, err
+			}
+		}
+		return updated, updatedKey, true, nil
+	case http.StatusOK:
+		merged := sanitizeChunkHeader(response.Header)
+		if sameStoredValidators(object.Header, merged) {
+			updated, updatedKey, _, err := c.renewChunkObject(ctx, baseKey, req.Header, policy, objectKey, object, merged, parseAge(response.Header.Get("Age")))
+			if err != nil {
+				return ChunkObject{}, "", false, err
+			}
+			if err := c.store.TouchChunkPrefix(ctx, rangeChunkPrefix(updatedKey), updated.InvalidAt); err != nil {
+				return ChunkObject{}, "", false, err
+			}
+			return updated, updatedKey, true, nil
+		}
+		updated, updatedKey, _, err := c.renewChunkObject(ctx, baseKey, req.Header, policy, objectKey, object, merged, parseAge(response.Header.Get("Age")))
+		if err != nil {
+			return ChunkObject{}, "", false, err
+		}
+		return updated, updatedKey, true, nil
+	default:
+		return object, objectKey, false, nil
+	}
+}
+
+func (c *RangeCache) renewChunkObject(ctx context.Context, baseKey string, requestHeader http.Header, policy Policy, currentObjectKey string, currentObject ChunkObject, header http.Header, baseAge int) (ChunkObject, string, bool, error) {
+	decision, ok := decideChunkObjectMetadata(c.now(), policy, header)
+	if !ok {
+		if err := c.purgeRangeStorage(ctx, baseKey); err != nil {
+			return ChunkObject{}, "", false, err
+		}
+		return ChunkObject{}, "", false, nil
+	}
+	decision.VaryHeaders = effectiveVaryHeaders(requestHeader, header, decision.VaryHeaders)
+	nextKey := buildStorageKey(baseKey, decision.VaryHeaders, requestHeader)
+	updated := ChunkObject{
+		Key:         nextKey,
+		SiteID:      policy.SiteID,
+		RuleID:      policy.RuleID,
+		PolicyTag:   policy.PolicyTag,
+		StoredAt:    c.now(),
+		FreshUntil:  c.now().Add(decision.TTL),
+		StaleUntil:  c.now().Add(decision.TTL + decision.StaleWindow),
+		InvalidAt:   c.now().Add(decision.TTL + decision.StaleWindow + decision.StaleIfError),
+		BaseAge:     baseAge,
+		Header:      sanitizeChunkHeader(header),
+		TotalLength: currentObject.TotalLength,
+		ChunkSize:   currentObject.ChunkSize,
+	}
+	if !updated.InvalidAt.After(updated.StoredAt) && hasRevalidationValidators(header) {
+		updated.InvalidAt = updated.StoredAt.Add(DefaultManagedTTL)
+	}
+	if updated.InvalidAt.Before(updated.StoredAt) {
+		updated.InvalidAt = updated.StoredAt
+	}
+	if updated.StaleUntil.Before(updated.FreshUntil) {
+		updated.StaleUntil = updated.FreshUntil
+	}
+
+	if err := c.storeChunkObject(ctx, baseKey, nextKey, updated, decision.VaryHeaders, currentObject, true); err != nil {
+		return ChunkObject{}, "", false, err
+	}
+	sameVersion := currentObjectKey == nextKey && sameStoredValidators(currentObject.Header, updated.Header)
+	return updated, nextKey, sameVersion, nil
 }
 
 func (c *RangeCache) persistChunkResponse(ctx context.Context, response StoredResponse) (StoredResponse, error) {
@@ -721,6 +863,13 @@ func buildChunkObject(now time.Time, objectKey string, policy Policy, decision s
 	return object
 }
 
+func canRevalidateChunkObject(policy Policy, object ChunkObject) bool {
+	if policy.Mode != model.CacheModeFollowOrigin {
+		return false
+	}
+	return hasRevalidationValidators(object.Header)
+}
+
 func decideChunkStore(now time.Time, policy Policy, response StoredResponse) storeDecision {
 	if response.StatusCode != http.StatusPartialContent || response.Header.Get("Content-Range") == "" {
 		return storeDecision{}
@@ -787,6 +936,53 @@ func decideChunkStore(now time.Time, policy Policy, response StoredResponse) sto
 			StaleIfError: staleIfError,
 			VaryHeaders:  varyHeaders,
 		}
+	}
+}
+
+func decideChunkObjectMetadata(now time.Time, policy Policy, header http.Header) (storeDecision, bool) {
+	switch policy.Mode {
+	case model.CacheModeBypass:
+		return storeDecision{}, false
+	case model.CacheModeFollowOrigin:
+		directives := parseCacheControl(httpx.CombinedHeaderValue(header, "Cache-Control"))
+		if directives.noStore || directives.isPrivate {
+			return storeDecision{}, false
+		}
+		ttl, ok := directives.ttl(now, header.Get("Expires"))
+		if !ok {
+			return storeDecision{}, false
+		}
+		staleWindow := directives.staleWhileRevalidate
+		if policy.Optimistic {
+			staleWindow = maxDuration(staleWindow, policy.OptimisticMaxStale)
+		}
+		varyHeaders, cacheable := parseVary(header.Values("Vary"))
+		if !cacheable {
+			return storeDecision{}, false
+		}
+		staleIfError := directives.staleIfError
+		if ttl == 0 && staleWindow == 0 && staleIfError == 0 && !hasRevalidationValidators(header) {
+			return storeDecision{}, false
+		}
+		return storeDecision{Store: true, TTL: ttl, StaleWindow: staleWindow, StaleIfError: staleIfError, VaryHeaders: varyHeaders}, true
+	default:
+		ttl := policy.TTL
+		if !policy.HasTTL {
+			ttl = DefaultManagedTTL
+		}
+		staleWindow := time.Duration(0)
+		if policy.Optimistic {
+			staleWindow = policy.OptimisticMaxStale
+		}
+		staleIfError := time.Duration(0)
+		if policy.HasStaleIfError {
+			staleIfError = policy.StaleIfError
+		}
+		varyHeaders, cacheable := parseVary(header.Values("Vary"))
+		if !cacheable {
+			return storeDecision{}, false
+		}
+		return storeDecision{Store: true, TTL: ttl, StaleWindow: staleWindow, StaleIfError: staleIfError, VaryHeaders: varyHeaders}, true
 	}
 }
 

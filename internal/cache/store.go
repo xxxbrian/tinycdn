@@ -57,6 +57,7 @@ type Store interface {
 	PutChunkObject(ctx context.Context, key string, object ChunkObject) error
 	GetChunk(ctx context.Context, key string) (ChunkEntry, bool, error)
 	PutChunk(ctx context.Context, key string, chunk ChunkEntry) error
+	TouchChunkPrefix(ctx context.Context, prefix string, invalidAt time.Time) error
 	GetVary(ctx context.Context, key string) (VarySpec, bool, error)
 	PutVary(ctx context.Context, key string, spec VarySpec) error
 	ImportBody(ctx context.Context, tempPath string) (string, error)
@@ -280,6 +281,44 @@ func (s *BadgerStore) PutChunk(ctx context.Context, key string, chunk ChunkEntry
 
 	if found && existing.BodyPath != "" && existing.BodyPath != chunk.BodyPath {
 		if err := removeBodyPath(existing.BodyPath); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *BadgerStore) TouchChunkPrefix(ctx context.Context, prefix string, invalidAt time.Time) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	chunks := make([]ChunkEntry, 0)
+	err := s.db.View(func(txn *badger.Txn) error {
+		opts := badger.DefaultIteratorOptions
+		it := txn.NewIterator(opts)
+		defer it.Close()
+
+		for it.Seek([]byte(prefix)); it.ValidForPrefix([]byte(prefix)); it.Next() {
+			item := it.Item()
+			if err := item.Value(func(value []byte) error {
+				chunk, err := decodeChunkEntry(append([]byte(nil), value...))
+				if err != nil {
+					return err
+				}
+				chunks = append(chunks, chunk)
+				return nil
+			}); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	for _, chunk := range chunks {
+		chunk.InvalidAt = invalidAt
+		if err := s.PutChunk(ctx, chunk.Key, chunk); err != nil {
 			return err
 		}
 	}
