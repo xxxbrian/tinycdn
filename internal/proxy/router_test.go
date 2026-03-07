@@ -64,6 +64,50 @@ func TestRouterCacheHeadersAndHeadBehavior(t *testing.T) {
 	}
 }
 
+func TestRouterHeadColdMissFetchesGetAndPreservesLength(t *testing.T) {
+	var upstreamHits atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		upstreamHits.Add(1)
+		if req.Method != http.MethodGet {
+			t.Fatalf("expected HEAD cold miss to fetch GET upstream, got %s", req.Method)
+		}
+		rw.Header().Set("Content-Type", "text/plain")
+		rw.WriteHeader(http.StatusOK)
+		_, _ = rw.Write([]byte("payload"))
+	}))
+	defer upstream.Close()
+
+	router := newTestRouter(t, newTestSnapshot(t, upstream.URL))
+	defer router.Close()
+
+	headReq := httptest.NewRequest(http.MethodHead, "http://cdn.example.com/assets/app.js", nil)
+	headReq.Host = "cdn.example.com"
+	head := httptest.NewRecorder()
+	router.ServeHTTP(head, headReq)
+
+	if got := head.Result().Header.Get(headerTinyCDNCache); got != "MISS" {
+		t.Fatalf("expected cold HEAD request MISS, got %q", got)
+	}
+	if got := head.Result().Header.Get("Content-Length"); got != "7" {
+		t.Fatalf("expected HEAD cold miss to preserve GET content length, got %q", got)
+	}
+	if head.Body.Len() != 0 {
+		t.Fatalf("expected no HEAD body, got %q", head.Body.String())
+	}
+
+	getReq := httptest.NewRequest(http.MethodGet, "http://cdn.example.com/assets/app.js", nil)
+	getReq.Host = "cdn.example.com"
+	get := httptest.NewRecorder()
+	router.ServeHTTP(get, getReq)
+
+	if got := get.Result().Header.Get(headerTinyCDNCache); got != "HIT" {
+		t.Fatalf("expected GET after HEAD warm to hit, got %q", got)
+	}
+	if got := upstreamHits.Load(); got != 1 {
+		t.Fatalf("expected one upstream fetch, got %d", got)
+	}
+}
+
 func TestRouterBypassesRangeRequests(t *testing.T) {
 	var upstreamHits atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {

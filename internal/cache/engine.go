@@ -79,6 +79,7 @@ type Engine struct {
 	store   Store
 	now     func() time.Time
 	refresh singleflight.Group
+	fill    singleflight.Group
 }
 
 func NewEngine(store Store) *Engine {
@@ -122,7 +123,7 @@ func (e *Engine) Handle(ctx context.Context, req *http.Request, policy Policy, f
 	now := e.now()
 
 	if found && entry.PolicyTag == policy.PolicyTag {
-		if !now.After(entry.FreshUntil) && !shouldForceRefresh(req, policy) {
+		if now.Before(entry.FreshUntil) && !shouldForceRefresh(req, policy) {
 			return entryResult(entry, StateHit, now), nil
 		}
 
@@ -132,7 +133,7 @@ func (e *Engine) Handle(ctx context.Context, req *http.Request, policy Policy, f
 		}
 	}
 
-	response, err := fetch(ctx, preparedReq)
+	response, err := e.fetchWithCollapse(ctx, cacheKey, preparedReq, fetch)
 	if err != nil {
 		if found && canServeStaleOnError(now, policy, entry) {
 			return entryResult(entry, StateStale, now), nil
@@ -177,6 +178,20 @@ func (e *Engine) refreshInBackground(ctx context.Context, cacheKey string, req *
 		entry := buildEntry(now, nextKey, policy, decision, response)
 		return nil, e.storeResponse(refreshCtx, baseKey, entry, decision.VaryHeaders)
 	})
+}
+
+func (e *Engine) fetchWithCollapse(ctx context.Context, cacheKey string, req *http.Request, fetch FetchFunc) (StoredResponse, error) {
+	value, err, _ := e.fill.Do(cacheKey, func() (any, error) {
+		return fetch(ctx, req)
+	})
+	if err != nil {
+		return StoredResponse{}, err
+	}
+	response, ok := value.(StoredResponse)
+	if !ok {
+		return StoredResponse{}, fmt.Errorf("unexpected collapsed response type %T", value)
+	}
+	return response, nil
 }
 
 func (e *Engine) PurgeSite(ctx context.Context, siteID string) (int, error) {
@@ -303,7 +318,7 @@ func decideStore(now time.Time, policy Policy, response StoredResponse) storeDec
 		return storeDecision{}
 	case model.CacheModeFollowOrigin:
 		directives := parseCacheControl(httpx.CombinedHeaderValue(response.Header, "Cache-Control"))
-		if directives.noStore || directives.isPrivate || directives.noCache {
+		if directives.noStore || directives.isPrivate {
 			return storeDecision{}
 		}
 
@@ -418,6 +433,9 @@ func prepareRequest(req *http.Request, policy Policy) (*http.Request, State) {
 	for _, headerName := range conditionalRequestHeaders {
 		cloned.Header.Del(headerName)
 	}
+	if cloned.Method == http.MethodHead {
+		cloned.Method = http.MethodGet
+	}
 
 	return cloned, StateMiss
 }
@@ -433,7 +451,7 @@ func shouldForceRefresh(req *http.Request, policy Policy) bool {
 }
 
 func shouldStoreResponse(method string) bool {
-	return method == http.MethodGet
+	return method == http.MethodGet || method == http.MethodHead
 }
 
 func cacheKeyMethod(method string) string {

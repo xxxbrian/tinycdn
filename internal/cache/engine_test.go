@@ -546,12 +546,14 @@ func TestEngineRequestBehaviorMatrix(t *testing.T) {
 		rangeHdr  string
 		policy    Policy
 		wantState State
+		wantFetch string
 	}{
 		{
 			name:      "post bypasses cache",
 			method:    http.MethodPost,
 			policy:    Policy{Mode: model.CacheModeForceCache},
 			wantState: StateBypass,
+			wantFetch: http.MethodPost,
 		},
 		{
 			name:      "range request bypasses cache",
@@ -559,18 +561,21 @@ func TestEngineRequestBehaviorMatrix(t *testing.T) {
 			rangeHdr:  "bytes=0-99",
 			policy:    Policy{Mode: model.CacheModeForceCache},
 			wantState: StateBypass,
+			wantFetch: http.MethodGet,
 		},
 		{
 			name:      "bypass mode bypasses cache",
 			method:    http.MethodGet,
 			policy:    Policy{Mode: model.CacheModeBypass},
 			wantState: StateBypass,
+			wantFetch: http.MethodGet,
 		},
 		{
 			name:      "head stays cacheable pipeline",
 			method:    http.MethodHead,
 			policy:    Policy{Mode: model.CacheModeForceCache},
 			wantState: StateMiss,
+			wantFetch: http.MethodGet,
 		},
 	}
 
@@ -585,8 +590,8 @@ func TestEngineRequestBehaviorMatrix(t *testing.T) {
 			if state != tt.wantState {
 				t.Fatalf("expected %s, got %s", tt.wantState, state)
 			}
-			if prepared.Method != req.Method {
-				t.Fatalf("expected method to be preserved, got %s", prepared.Method)
+			if prepared.Method != tt.wantFetch {
+				t.Fatalf("expected prepared method %s, got %s", tt.wantFetch, prepared.Method)
 			}
 		})
 	}
@@ -632,6 +637,158 @@ func TestEngineHeadUsesGetCacheKey(t *testing.T) {
 	}
 	if fetches != 1 {
 		t.Fatalf("expected one upstream fetch, got %d", fetches)
+	}
+}
+
+func TestEngineHeadColdMissFetchesGetAndWarmsObject(t *testing.T) {
+	store := newMemoryStore()
+	engine := NewEngine(store)
+	now := time.Date(2026, time.March, 7, 0, 0, 0, 0, time.UTC)
+	engine.now = func() time.Time { return now }
+
+	policy := Policy{
+		SiteID:    "site-1",
+		RuleID:    "rule-1",
+		PolicyTag: "rule-1|force",
+		Mode:      model.CacheModeForceCache,
+		TTL:       time.Minute,
+		HasTTL:    true,
+	}
+
+	seenMethods := make([]string, 0, 2)
+	fetch := func(_ context.Context, req *http.Request) (StoredResponse, error) {
+		seenMethods = append(seenMethods, req.Method)
+		return StoredResponse{
+			StatusCode: http.StatusOK,
+			Header: http.Header{
+				"Content-Type":   {"text/plain"},
+				"Content-Length": {"7"},
+			},
+			Body: []byte("payload"),
+		}, nil
+	}
+
+	headReq := httptest.NewRequest(http.MethodHead, "https://cdn.example.com/assets/app.js", nil)
+	headResult, err := engine.Handle(context.Background(), headReq, policy, fetch)
+	if err != nil {
+		t.Fatalf("head miss handle: %v", err)
+	}
+	if headResult.State != StateMiss {
+		t.Fatalf("expected cold HEAD to miss, got %s", headResult.State)
+	}
+	if len(seenMethods) != 1 || seenMethods[0] != http.MethodGet {
+		t.Fatalf("expected HEAD miss to fetch GET once, got %#v", seenMethods)
+	}
+	if string(headResult.Body) != "payload" {
+		t.Fatalf("expected HEAD miss to return fetched body to router layer, got %q", string(headResult.Body))
+	}
+
+	getReq := httptest.NewRequest(http.MethodGet, "https://cdn.example.com/assets/app.js", nil)
+	getResult, err := engine.Handle(context.Background(), getReq, policy, fetch)
+	if err != nil {
+		t.Fatalf("get hit after head warm: %v", err)
+	}
+	if getResult.State != StateHit {
+		t.Fatalf("expected GET after HEAD miss to hit, got %s", getResult.State)
+	}
+	if len(seenMethods) != 1 {
+		t.Fatalf("expected cache warm from HEAD miss to avoid second fetch, got %#v", seenMethods)
+	}
+}
+
+func TestEngineCollapsesConcurrentColdMisses(t *testing.T) {
+	store := newMemoryStore()
+	engine := NewEngine(store)
+	now := time.Date(2026, time.March, 7, 0, 0, 0, 0, time.UTC)
+	engine.now = func() time.Time { return now }
+
+	policy := Policy{
+		SiteID:    "site-1",
+		RuleID:    "rule-1",
+		PolicyTag: "rule-1|force",
+		Mode:      model.CacheModeForceCache,
+		TTL:       time.Minute,
+		HasTTL:    true,
+	}
+
+	const requests = 8
+	req := httptest.NewRequest(http.MethodGet, "https://cdn.example.com/assets/app.js", nil)
+	start := make(chan struct{})
+	entered := make(chan struct{}, requests)
+	fetchCount := 0
+	var mu sync.Mutex
+	fetch := func(_ context.Context, req *http.Request) (StoredResponse, error) {
+		mu.Lock()
+		fetchCount++
+		mu.Unlock()
+		entered <- struct{}{}
+		<-start
+		return StoredResponse{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": {"text/plain"}},
+			Body:       []byte("payload"),
+		}, nil
+	}
+
+	var wg sync.WaitGroup
+	results := make(chan Result, requests)
+	errs := make(chan error, requests)
+	for range requests {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			result, err := engine.Handle(context.Background(), req.Clone(context.Background()), policy, fetch)
+			if err != nil {
+				errs <- err
+				return
+			}
+			results <- result
+		}()
+	}
+
+	<-entered
+	close(start)
+	wg.Wait()
+	close(results)
+	close(errs)
+
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("collapsed miss failed: %v", err)
+		}
+	}
+
+	mu.Lock()
+	if fetchCount != 1 {
+		t.Fatalf("expected one collapsed upstream fetch, got %d", fetchCount)
+	}
+	mu.Unlock()
+
+	misses := 0
+	hits := 0
+	for result := range results {
+		switch result.State {
+		case StateMiss:
+			misses++
+		case StateHit:
+			hits++
+		default:
+			t.Fatalf("expected collapsed cold requests to return MISS or HIT, got %s", result.State)
+		}
+	}
+	if misses == 0 {
+		t.Fatalf("expected at least one cold request to miss")
+	}
+	if misses+hits != requests {
+		t.Fatalf("expected %d total collapsed results, got %d", requests, misses+hits)
+	}
+
+	hit, err := engine.Handle(context.Background(), req, policy, fetch)
+	if err != nil {
+		t.Fatalf("post-collapse hit: %v", err)
+	}
+	if hit.State != StateHit {
+		t.Fatalf("expected subsequent request to hit, got %s", hit.State)
 	}
 }
 
@@ -705,9 +862,9 @@ func TestEngineFollowOriginRequestAndResponseMatrix(t *testing.T) {
 			requestNoCache: true,
 		},
 		{
-			name:        "response no-cache is not stored",
+			name:        "response no-cache stores but revalidates every time",
 			header:      http.Header{"Cache-Control": {"public, no-cache"}},
-			wantStored:  false,
+			wantStored:  true,
 			wantSecond:  StateMiss,
 			wantFetches: 2,
 		},
@@ -806,6 +963,12 @@ func TestEngineFollowOriginRequestAndResponseMatrix(t *testing.T) {
 			}
 			if fetches != tt.wantFetches {
 				t.Fatalf("expected %d fetches, got %d", tt.wantFetches, fetches)
+			}
+			if tt.name == "response no-cache stores but revalidates every time" {
+				baseKey := buildBaseCacheKey("site-1", http.MethodGet, "/assets/app.js", "")
+				if _, found, err := store.GetEntry(context.Background(), responseKey(baseKey)); err != nil || !found {
+					t.Fatalf("expected no-cache response to remain stored for edge revalidation, found=%t err=%v", found, err)
+				}
 			}
 		})
 	}
