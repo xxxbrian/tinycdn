@@ -66,3 +66,31 @@ func TestValidateSiteUpstreamHostMode(t *testing.T) {
 		}
 	})
 }
+
+func TestValidateRuleOptimisticMode(t *testing.T) {
+	rule := Rule{
+		ID:      "rule-1",
+		Name:    "Rule 1",
+		Enabled: true,
+		Match: MatchSpec{
+			Clauses: []MatchClause{
+				{
+					Field:    MatchFieldHostname,
+					Operator: MatchOperatorEquals,
+					Value:    "example.com",
+				},
+			},
+		},
+		Action: RuleAction{
+			Cache: CacheAction{
+				Mode:       CacheModeBypass,
+				Optimistic: true,
+			},
+		},
+	}
+
+	err := validateRule(rule, false)
+	if err == nil || !strings.Contains(err.Error(), "optimistic is not supported for bypass") {
+		t.Fatalf("expected bypass to reject optimistic mode, got %v", err)
+	}
+}

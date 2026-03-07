@@ -3,7 +3,6 @@ package runtime
 import (
 	"fmt"
 	"net/http"
-	"net/http/httputil"
 	"net/url"
 	"strings"
 	"sync/atomic"
@@ -12,12 +11,6 @@ import (
 	"github.com/bmatcuk/doublestar/v4"
 
 	"tinycdn/internal/model"
-)
-
-const (
-	DefaultManagedTTL        = 5 * time.Minute
-	MaxManagedStaleRetention = 365 * 24 * time.Hour
-	DefaultOptimisticSWR     = 365 * 24 * time.Hour
 )
 
 type Snapshot struct {
@@ -31,7 +24,6 @@ type CompiledSite struct {
 	Upstream     *url.URL
 	UpstreamHost string
 	UpstreamMode model.UpstreamHostMode
-	Proxy        *httputil.ReverseProxy
 	Rules        []CompiledRule
 }
 
@@ -41,6 +33,7 @@ type CompiledRule struct {
 	HasTTL          bool
 	StaleIfError    time.Duration
 	HasStaleIfError bool
+	Optimistic      bool
 }
 
 type Manager struct {
@@ -113,8 +106,6 @@ func compileSite(site model.Site) (*CompiledSite, error) {
 		compiled.Rules = append(compiled.Rules, compiledRule)
 	}
 
-	compiled.Proxy = buildReverseProxy(compiled)
-
 	return compiled, nil
 }
 
@@ -133,6 +124,7 @@ func compileRule(rule model.Rule) (CompiledRule, error) {
 		HasTTL:          hasTTL,
 		StaleIfError:    staleIfError,
 		HasStaleIfError: hasStaleIfError,
+		Optimistic:      rule.Action.Cache.Optimistic,
 	}, nil
 }
 

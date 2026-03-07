@@ -104,10 +104,7 @@ func NewSite(input SiteInput) model.Site {
 		ID:      siteID,
 		Name:    input.Name,
 		Enabled: input.Enabled,
-		Cache: model.SiteCache{
-			OptimisticRefresh: input.OptimisticRefresh,
-		},
-		Hosts: append([]string(nil), input.Hosts...),
+		Hosts:   append([]string(nil), input.Hosts...),
 		Upstream: model.Upstream{
 			URL:      input.UpstreamURL,
 			HostMode: model.UpstreamHostMode(input.UpstreamHostMode),
@@ -122,14 +119,13 @@ func NewSite(input SiteInput) model.Site {
 }
 
 type SiteInput struct {
-	ID                string   `json:"id"`
-	Name              string   `json:"name"`
-	Enabled           bool     `json:"enabled"`
-	OptimisticRefresh bool     `json:"optimistic_refresh"`
-	Hosts             []string `json:"hosts"`
-	UpstreamURL       string   `json:"upstream_url"`
-	UpstreamHostMode  string   `json:"upstream_host_mode"`
-	UpstreamHost      string   `json:"upstream_host"`
+	ID               string   `json:"id"`
+	Name             string   `json:"name"`
+	Enabled          bool     `json:"enabled"`
+	Hosts            []string `json:"hosts"`
+	UpstreamURL      string   `json:"upstream_url"`
+	UpstreamHostMode string   `json:"upstream_host_mode"`
+	UpstreamHost     string   `json:"upstream_host"`
 }
 
 func (s *Service) CreateSite(input SiteInput) (model.Site, error) {
@@ -153,7 +149,6 @@ func (s *Service) UpdateSite(id string, input SiteInput) (model.Site, error) {
 
 		cfg.Sites[index].Name = input.Name
 		cfg.Sites[index].Enabled = input.Enabled
-		cfg.Sites[index].Cache.OptimisticRefresh = input.OptimisticRefresh
 		cfg.Sites[index].Hosts = append([]string(nil), input.Hosts...)
 		cfg.Sites[index].Upstream.URL = input.UpstreamURL
 		cfg.Sites[index].Upstream.HostMode = model.UpstreamHostMode(input.UpstreamHostMode)

@@ -16,7 +16,6 @@ func TestCreateRulePreservesDisabledState(t *testing.T) {
 				ID:      "site-1",
 				Name:    "Site 1",
 				Enabled: true,
-				Cache:   model.SiteCache{},
 				Hosts:   []string{"example.com"},
 				Upstream: model.Upstream{
 					URL: "https://origin.example.com",

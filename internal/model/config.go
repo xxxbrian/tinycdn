@@ -15,17 +15,12 @@ type AppConfig struct {
 }
 
 type Site struct {
-	ID       string    `json:"id" yaml:"id"`
-	Name     string    `json:"name" yaml:"name"`
-	Enabled  bool      `json:"enabled" yaml:"enabled"`
-	Cache    SiteCache `json:"cache" yaml:"cache"`
-	Hosts    []string  `json:"hosts" yaml:"hosts"`
-	Upstream Upstream  `json:"upstream" yaml:"upstream"`
-	Rules    []Rule    `json:"rules" yaml:"rules"`
-}
-
-type SiteCache struct {
-	OptimisticRefresh bool `json:"optimistic_refresh" yaml:"optimistic_refresh"`
+	ID       string   `json:"id" yaml:"id"`
+	Name     string   `json:"name" yaml:"name"`
+	Enabled  bool     `json:"enabled" yaml:"enabled"`
+	Hosts    []string `json:"hosts" yaml:"hosts"`
+	Upstream Upstream `json:"upstream" yaml:"upstream"`
+	Rules    []Rule   `json:"rules" yaml:"rules"`
 }
 
 type Upstream struct {
@@ -66,6 +61,7 @@ type CacheAction struct {
 	Mode         CacheMode `json:"mode" yaml:"mode"`
 	TTL          string    `json:"ttl,omitempty" yaml:"ttl,omitempty"`
 	StaleIfError string    `json:"stale_if_error,omitempty" yaml:"stale_if_error,omitempty"`
+	Optimistic   bool      `json:"optimistic,omitempty" yaml:"optimistic,omitempty"`
 }
 
 type CacheMode string
@@ -323,6 +319,9 @@ func validateRule(rule Rule, isLast bool) error {
 		if err := validatePositiveDuration(rule.Action.Cache.StaleIfError); err != nil {
 			return fmt.Errorf("invalid stale_if_error: %w", err)
 		}
+	}
+	if rule.Action.Cache.Optimistic && rule.Action.Cache.Mode == CacheModeBypass {
+		return errors.New("optimistic is not supported for bypass")
 	}
 
 	if rule.Match.Any {

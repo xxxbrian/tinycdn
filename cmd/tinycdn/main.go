@@ -24,7 +24,7 @@ func main() {
 		proxyAddr  = flag.String("proxy-addr", ":8080", "proxy data-plane listen address")
 		configPath = flag.String("config", "./data/config.yaml", "path to persisted YAML config")
 		uiDir      = flag.String("ui-dir", "./web/dist", "path to built frontend assets")
-		cacheDir   = flag.String("cache-dir", "./data/cache/badger", "path to Souin badger cache directory")
+		cacheDir   = flag.String("cache-dir", "./data/cache/badger", "path to TinyCDN badger cache directory")
 	)
 	flag.Parse()
 
@@ -59,9 +59,20 @@ func main() {
 		Addr:    *adminAddr,
 		Handler: admin.NewRouter(service, *uiDir),
 	}
+	proxyRouter, err := proxy.NewRouter(service.RuntimeSnapshot, *cacheDir)
+	if err != nil {
+		logger.Error("failed to initialize proxy router", "error", err)
+		os.Exit(1)
+	}
+	defer func() {
+		if err := proxyRouter.Close(); err != nil {
+			logger.Error("proxy router shutdown failed", "error", err)
+		}
+	}()
+
 	proxyServer := &http.Server{
 		Addr:    *proxyAddr,
-		Handler: proxy.NewRouter(service.RuntimeSnapshot, *cacheDir),
+		Handler: proxyRouter,
 	}
 
 	go func() {

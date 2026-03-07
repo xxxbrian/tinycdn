@@ -1,171 +1,104 @@
 package proxy
 
 import (
+	"context"
+	"fmt"
 	"net/http"
-	"slices"
-	"strings"
+	"strconv"
 
-	"github.com/darkweak/souin/configurationtypes"
-	souinmiddleware "github.com/darkweak/souin/pkg/middleware"
-	souinchi "github.com/darkweak/souin/plugins/chi"
-
+	"tinycdn/internal/cache"
 	"tinycdn/internal/runtime"
 )
 
-func NewRouter(snapshot func() *runtime.Snapshot, cachePath string) http.Handler {
-	cache := souinchi.NewHTTPCache(souinmiddleware.BaseConfiguration{
-		DefaultCache: &configurationtypes.DefaultCache{
-			TTL: configurationtypes.Duration{
-				Duration: runtime.DefaultManagedTTL,
-			},
-			Stale: configurationtypes.Duration{
-				Duration: runtime.MaxManagedStaleRetention,
-			},
-			Badger: configurationtypes.CacheProvider{
-				Path: cachePath,
-			},
-		},
-		LogLevel: "error",
-	})
+const (
+	headerTinyCDNCache = "X-TinyCDN-Cache"
+	headerTinyCDNSite  = "X-TinyCDN-Site"
+	headerTinyCDNRule  = "X-TinyCDN-Rule"
+	headerCacheStatus  = "Cache-Status"
+)
 
-	return http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
-		if req.URL.Path == "/healthz" {
-			rw.WriteHeader(http.StatusOK)
-			_, _ = rw.Write([]byte("ok"))
-			return
-		}
-
-		matchHandler := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
-			current := snapshot()
-			site := current.SiteByHost(req.Host)
-			if site == nil || !site.Source.Enabled {
-				http.NotFound(rw, req)
-				return
-			}
-
-			rule := site.MatchRule(req)
-			if rule == nil {
-				http.Error(rw, "no matching rule in runtime snapshot", http.StatusInternalServerError)
-				return
-			}
-
-			ctx := runtime.ContextWithRequestContext(req.Context(), runtime.RequestContext{
-				Site: site,
-				Rule: rule,
-			})
-			cacheReq := req.Clone(ctx)
-			runtime.ApplyRuleRequestHeaders(cacheReq, rule)
-			filteredWriter := newInternalHeaderFilter(rw)
-
-			cache.Handle(http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
-				site.Proxy.ServeHTTP(rw, req.WithContext(ctx))
-			})).ServeHTTP(filteredWriter, cacheReq)
-		})
-
-		matchHandler.ServeHTTP(rw, req)
-	})
+type Router struct {
+	engine   *cache.Engine
+	store    cache.Store
+	fetcher  *upstreamFetcher
+	snapshot func() *runtime.Snapshot
 }
 
-type internalHeaderFilter struct {
-	rw          http.ResponseWriter
-	header      http.Header
-	wroteHeader bool
-}
-
-func newInternalHeaderFilter(rw http.ResponseWriter) *internalHeaderFilter {
-	return &internalHeaderFilter{
-		rw:     rw,
-		header: make(http.Header),
+func NewRouter(snapshot func() *runtime.Snapshot, cachePath string) (*Router, error) {
+	store, err := cache.NewBadgerStore(cachePath)
+	if err != nil {
+		return nil, err
 	}
+
+	return &Router{
+		engine:   cache.NewEngine(store),
+		store:    store,
+		fetcher:  newUpstreamFetcher(),
+		snapshot: snapshot,
+	}, nil
 }
 
-func (f *internalHeaderFilter) Header() http.Header {
-	return f.header
+func (r *Router) Close() error {
+	return r.store.Close()
 }
 
-func (f *internalHeaderFilter) WriteHeader(statusCode int) {
-	if f.wroteHeader {
+func (r *Router) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
+	if req.URL.Path == "/healthz" {
+		rw.WriteHeader(http.StatusOK)
+		_, _ = rw.Write([]byte("ok"))
 		return
 	}
 
-	restoreClientCacheControl(f.header)
-	f.header.Set(runtime.HeaderTinyCDNCache, deriveTinyCDNCache(f.header, statusCode))
+	current := r.snapshot()
+	site := current.SiteByHost(req.Host)
+	if site == nil || !site.Source.Enabled {
+		http.NotFound(rw, req)
+		return
+	}
 
-	for key, values := range f.header {
-		if isInternalCacheHeader(key) {
-			continue
-		}
+	rule := site.MatchRule(req)
+	if rule == nil {
+		http.Error(rw, "no matching rule in runtime snapshot", http.StatusInternalServerError)
+		return
+	}
+
+	policy := cache.BuildPolicy(site.Source.ID, rule.Source, rule.TTL, rule.HasTTL, rule.StaleIfError, rule.HasStaleIfError)
+	result, err := r.engine.Handle(req.Context(), req, policy, func(ctx context.Context, fetchReq *http.Request) (cache.StoredResponse, error) {
+		return r.fetcher.Fetch(ctx, fetchReq, site)
+	})
+	if err != nil {
+		writeErrorResponse(rw, site, rule, err)
+		return
+	}
+
+	writeResult(rw, req, site, rule, result)
+}
+
+func writeResult(rw http.ResponseWriter, req *http.Request, site *runtime.CompiledSite, rule *runtime.CompiledRule, result cache.Result) {
+	header := rw.Header()
+	for key, values := range result.Header {
 		for _, value := range values {
-			f.rw.Header().Add(key, value)
+			header.Add(key, value)
 		}
 	}
+	header.Set(headerTinyCDNCache, string(result.State))
+	header.Set(headerTinyCDNSite, site.Source.ID)
+	header.Set(headerTinyCDNRule, rule.Source.ID)
+	header.Set(headerCacheStatus, result.CacheStatus)
+	header.Set("Content-Length", strconv.Itoa(len(result.Body)))
 
-	f.wroteHeader = true
-	f.rw.WriteHeader(statusCode)
-}
-
-func (f *internalHeaderFilter) Write(body []byte) (int, error) {
-	if !f.wroteHeader {
-		f.WriteHeader(http.StatusOK)
+	rw.WriteHeader(result.StatusCode)
+	if req.Method == http.MethodHead {
+		return
 	}
-
-	return f.rw.Write(body)
+	_, _ = rw.Write(result.Body)
 }
 
-func (f *internalHeaderFilter) Flush() {
-	if flusher, ok := f.rw.(http.Flusher); ok {
-		if !f.wroteHeader {
-			f.WriteHeader(http.StatusOK)
-		}
-		flusher.Flush()
-	}
-}
-
-func restoreClientCacheControl(header http.Header) {
-	clientCacheControl := header.Get(runtime.HeaderClientCacheControl)
-	clientCacheControlAbsent := header.Get(runtime.HeaderClientCacheControlAbsent)
-
-	switch {
-	case clientCacheControlAbsent == "1":
-		header.Del("Cache-Control")
-	case clientCacheControl != "":
-		header.Del("Cache-Control")
-		header.Set("Cache-Control", clientCacheControl)
-	}
-
-	header.Del(runtime.HeaderClientCacheControl)
-	header.Del(runtime.HeaderClientCacheControlAbsent)
-}
-
-func isInternalCacheHeader(headerName string) bool {
-	return slices.Contains([]string{
-		runtime.HeaderClientCacheControl,
-		runtime.HeaderClientCacheControlAbsent,
-		runtime.HeaderSouinCacheControl,
-		runtime.HeaderSurrogateControl,
-		runtime.HeaderCDNCacheControl,
-	}, headerName)
-}
-
-func deriveTinyCDNCache(header http.Header, statusCode int) string {
-	cacheStatus := strings.ToLower(header.Get("Cache-Status"))
-
-	switch {
-	case strings.Contains(cacheStatus, "detail=serve-http-error"),
-		strings.Contains(cacheStatus, "detail=deadline-exceeded"):
-		return "ERROR"
-	case strings.Contains(cacheStatus, "fwd=stale"):
-		return "STALE"
-	case strings.Contains(cacheStatus, "; hit"):
-		return "HIT"
-	case strings.Contains(cacheStatus, "fwd=bypass"):
-		return "BYPASS"
-	case strings.Contains(cacheStatus, "fwd=uri-miss"),
-		strings.Contains(cacheStatus, "fwd=request"):
-		return "MISS"
-	case statusCode >= http.StatusInternalServerError:
-		return "ERROR"
-	default:
-		return "MISS"
-	}
+func writeErrorResponse(rw http.ResponseWriter, site *runtime.CompiledSite, rule *runtime.CompiledRule, err error) {
+	header := rw.Header()
+	header.Set(headerTinyCDNCache, string(cache.StateError))
+	header.Set(headerTinyCDNSite, site.Source.ID)
+	header.Set(headerTinyCDNRule, rule.Source.ID)
+	header.Set(headerCacheStatus, "TinyCDN; fwd=error; detail=UPSTREAM")
+	http.Error(rw, fmt.Sprintf("proxy upstream error: %v", err), http.StatusBadGateway)
 }
