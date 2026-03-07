@@ -141,6 +141,86 @@ func TestRouterBypassesRangeRequests(t *testing.T) {
 	}
 }
 
+func TestRouterStreamsBypassRequests(t *testing.T) {
+	var upstreamHits atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		upstreamHits.Add(1)
+		rw.Header().Set("Content-Type", "text/plain")
+		rw.Header().Set("Content-Length", "7")
+		rw.WriteHeader(http.StatusOK)
+		_, _ = rw.Write([]byte("payload"))
+	}))
+	defer upstream.Close()
+
+	router := newTestRouter(t, newTestSnapshot(t, upstream.URL))
+	defer router.Close()
+
+	req := httptest.NewRequest(http.MethodGet, "http://cdn.example.com/assets/app.js", nil)
+	req.Host = "cdn.example.com"
+	req.Header.Set("Cookie", "session=abc123")
+
+	first := httptest.NewRecorder()
+	router.ServeHTTP(first, req)
+	second := httptest.NewRecorder()
+	router.ServeHTTP(second, req)
+
+	if got := first.Result().Header.Get(headerTinyCDNCache); got != "BYPASS" {
+		t.Fatalf("expected sensitive request BYPASS, got %q", got)
+	}
+	if got := first.Result().Header.Get(headerCacheStatus); got != "TinyCDN; fwd=bypass; detail=request" {
+		t.Fatalf("unexpected bypass cache status %q", got)
+	}
+	if first.Body.String() != "payload" {
+		t.Fatalf("unexpected bypass body %q", first.Body.String())
+	}
+	if got := second.Result().Header.Get(headerTinyCDNCache); got != "BYPASS" {
+		t.Fatalf("expected repeated sensitive request BYPASS, got %q", got)
+	}
+	if got := upstreamHits.Load(); got != 2 {
+		t.Fatalf("expected two upstream hits for streamed bypass, got %d", got)
+	}
+}
+
+func TestRouterStreamsOversizedObjectsWithoutCaching(t *testing.T) {
+	var upstreamHits atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		upstreamHits.Add(1)
+		rw.Header().Set("Content-Type", "text/plain")
+		rw.Header().Set("Content-Length", "10")
+		rw.WriteHeader(http.StatusOK)
+		_, _ = rw.Write([]byte("1234567890"))
+	}))
+	defer upstream.Close()
+
+	router := newTestRouter(t, newTestSnapshot(t, upstream.URL))
+	router.fetcher.maxBufferedObjectBytes = 4
+	defer router.Close()
+
+	req := httptest.NewRequest(http.MethodGet, "http://cdn.example.com/assets/app.js", nil)
+	req.Host = "cdn.example.com"
+
+	first := httptest.NewRecorder()
+	router.ServeHTTP(first, req)
+	second := httptest.NewRecorder()
+	router.ServeHTTP(second, req)
+
+	if got := first.Result().Header.Get(headerTinyCDNCache); got != "BYPASS" {
+		t.Fatalf("expected oversized response to bypass, got %q", got)
+	}
+	if got := first.Result().Header.Get(headerCacheStatus); got != "TinyCDN; fwd=bypass; detail=object-too-large" {
+		t.Fatalf("unexpected oversized cache status %q", got)
+	}
+	if first.Body.String() != "1234567890" {
+		t.Fatalf("unexpected oversized body %q", first.Body.String())
+	}
+	if got := second.Result().Header.Get(headerTinyCDNCache); got != "BYPASS" {
+		t.Fatalf("expected repeated oversized response to bypass, got %q", got)
+	}
+	if got := upstreamHits.Load(); got != 4 {
+		t.Fatalf("expected two fetch attempts plus two stream retries for oversized object, got %d", got)
+	}
+}
+
 func TestRouterStripsHopByHopResponseHeaders(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
 		rw.Header().Set("Connection", "keep-alive, X-Debug")

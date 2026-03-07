@@ -440,6 +440,11 @@ func prepareRequest(req *http.Request, policy Policy) (*http.Request, State) {
 	return cloned, StateMiss
 }
 
+func PreviewRequestBehavior(req *http.Request, policy Policy) State {
+	_, state := prepareRequest(req, policy)
+	return state
+}
+
 func hasSharedCacheSensitiveRequestHeaders(header http.Header) bool {
 	return header.Get("Authorization") != "" || len(header.Values("Cookie")) > 0
 }

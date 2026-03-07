@@ -2,11 +2,14 @@ package proxy
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 
 	"tinycdn/internal/cache"
+	"tinycdn/internal/httpx"
 	"tinycdn/internal/runtime"
 )
 
@@ -71,10 +74,18 @@ func (r *Router) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	}
 
 	policy := cache.BuildPolicy(site.Source.ID, rule.Source, rule.TTL, rule.HasTTL, rule.StaleIfError, rule.HasStaleIfError)
+	if cache.PreviewRequestBehavior(req, policy) == cache.StateBypass {
+		r.streamBypass(rw, req, site, rule, "request")
+		return
+	}
 	result, err := r.engine.Handle(req.Context(), req, policy, func(ctx context.Context, fetchReq *http.Request) (cache.StoredResponse, error) {
 		return r.fetcher.Fetch(ctx, fetchReq, site)
 	})
 	if err != nil {
+		if errors.Is(err, ErrUpstreamResponseTooLarge) {
+			r.streamBypass(rw, req, site, rule, "object-too-large")
+			return
+		}
 		writeErrorResponse(rw, site, rule, err)
 		return
 	}
@@ -100,6 +111,34 @@ func writeResult(rw http.ResponseWriter, req *http.Request, site *runtime.Compil
 		return
 	}
 	_, _ = rw.Write(result.Body)
+}
+
+func (r *Router) streamBypass(rw http.ResponseWriter, req *http.Request, site *runtime.CompiledSite, rule *runtime.CompiledRule, detail string) {
+	resp, err := r.fetcher.Open(req.Context(), req, site)
+	if err != nil {
+		writeErrorResponse(rw, site, rule, err)
+		return
+	}
+	defer resp.Body.Close()
+
+	header := rw.Header()
+	responseHeader := resp.Header.Clone()
+	httpx.StripHopByHopHeaders(responseHeader)
+	for key, values := range responseHeader {
+		for _, value := range values {
+			header.Add(key, value)
+		}
+	}
+	header.Set(headerTinyCDNCache, string(cache.StateBypass))
+	header.Set(headerTinyCDNSite, site.Source.ID)
+	header.Set(headerTinyCDNRule, rule.Source.ID)
+	header.Set(headerCacheStatus, "TinyCDN; fwd=bypass; detail="+detail)
+
+	rw.WriteHeader(resp.StatusCode)
+	if req.Method == http.MethodHead {
+		return
+	}
+	_, _ = io.Copy(rw, resp.Body)
 }
 
 func writeErrorResponse(rw http.ResponseWriter, site *runtime.CompiledSite, rule *runtime.CompiledRule, err error) {
