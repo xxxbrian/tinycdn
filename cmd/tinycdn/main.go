@@ -13,6 +13,7 @@ import (
 
 	"tinycdn/internal/admin"
 	"tinycdn/internal/app"
+	"tinycdn/internal/auth"
 	"tinycdn/internal/config"
 	"tinycdn/internal/proxy"
 	"tinycdn/internal/runtime"
@@ -31,6 +32,12 @@ func main() {
 	flag.Parse()
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	authConfig, err := auth.LoadConfigFromEnv()
+	if err != nil {
+		logger.Error("failed to load admin auth config", "error", err)
+		os.Exit(1)
+	}
 
 	store := config.NewStore(*configPath)
 	cfg, err := store.Load()
@@ -70,7 +77,7 @@ func main() {
 	service.SetCacheController(proxyRouter)
 	adminServer := &http.Server{
 		Addr:    *adminAddr,
-		Handler: admin.NewRouter(service, telemetryService, *uiDir),
+		Handler: admin.NewRouter(service, telemetryService, *uiDir, authConfig),
 	}
 	defer func() {
 		if err := telemetryService.Close(); err != nil {

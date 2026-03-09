@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -15,6 +16,7 @@ import (
 	"github.com/google/uuid"
 
 	"tinycdn/internal/app"
+	"tinycdn/internal/auth"
 	"tinycdn/internal/model"
 	"tinycdn/internal/observe"
 	"tinycdn/internal/telemetry"
@@ -26,17 +28,38 @@ type Router struct {
 	service   *app.Service
 	telemetry *telemetry.Service
 	uiDir     string
+	auth      auth.Config
 }
 
 type requestMetadata struct {
 	RequestID string
 	RemoteIP  string
+	Actor     string
 }
 
 type requestMetadataKey struct{}
 
-func NewRouter(service *app.Service, telemetryService *telemetry.Service, uiDir string) http.Handler {
-	router := &Router{service: service, telemetry: telemetryService, uiDir: uiDir}
+type identityKey struct{}
+
+type loginRequest struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
+
+type authResponse struct {
+	Token     string        `json:"token"`
+	User      authIdentity  `json:"user"`
+	ExpiresAt time.Time     `json:"expires_at"`
+	TokenTTL  time.Duration `json:"token_ttl"`
+}
+
+type authIdentity struct {
+	Username string `json:"username"`
+	Role     string `json:"role"`
+}
+
+func NewRouter(service *app.Service, telemetryService *telemetry.Service, uiDir string, authConfig auth.Config) http.Handler {
+	router := &Router{service: service, telemetry: telemetryService, uiDir: uiDir, auth: authConfig}
 
 	r := chi.NewRouter()
 	r.Use(router.withRequestMetadata)
@@ -45,24 +68,30 @@ func NewRouter(service *app.Service, telemetryService *telemetry.Service, uiDir 
 	})
 
 	r.Route("/api", func(api chi.Router) {
-		api.Get("/sites", router.listSites)
-		api.Post("/sites", router.createSite)
-		api.Get("/sites/{siteID}", router.getSite)
-		api.Put("/sites/{siteID}", router.updateSite)
-		api.Delete("/sites/{siteID}", router.deleteSite)
-		api.Get("/sites/{siteID}/rules", router.listRules)
-		api.Post("/sites/{siteID}/rules", router.createRule)
-		api.Put("/sites/{siteID}/rules/{ruleID}", router.updateRule)
-		api.Delete("/sites/{siteID}/rules/{ruleID}", router.deleteRule)
-		api.Post("/sites/{siteID}/rules/reorder", router.reorderRules)
-		api.Post("/sites/{siteID}/cache/purge", router.purgeCache)
+		api.Post("/auth/login", router.login)
+		api.Group(func(secured chi.Router) {
+			secured.Use(router.requireAuth)
+			secured.Get("/auth/me", router.me)
+			secured.Post("/auth/logout", router.logout)
+			secured.Get("/sites", router.listSites)
+			secured.Post("/sites", router.createSite)
+			secured.Get("/sites/{siteID}", router.getSite)
+			secured.Put("/sites/{siteID}", router.updateSite)
+			secured.Delete("/sites/{siteID}", router.deleteSite)
+			secured.Get("/sites/{siteID}/rules", router.listRules)
+			secured.Post("/sites/{siteID}/rules", router.createRule)
+			secured.Put("/sites/{siteID}/rules/{ruleID}", router.updateRule)
+			secured.Delete("/sites/{siteID}/rules/{ruleID}", router.deleteRule)
+			secured.Post("/sites/{siteID}/rules/reorder", router.reorderRules)
+			secured.Post("/sites/{siteID}/cache/purge", router.purgeCache)
 
-		api.Get("/analytics/report", router.analyticsReport)
-		api.Get("/logs/requests", router.requestLogs)
-		api.Get("/logs/audit", router.auditLogs)
-		api.Get("/sites/{siteID}/analytics/report", router.siteAnalyticsReport)
-		api.Get("/sites/{siteID}/logs/requests", router.siteRequestLogs)
-		api.Get("/sites/{siteID}/logs/audit", router.siteAuditLogs)
+			secured.Get("/analytics/report", router.analyticsReport)
+			secured.Get("/logs/requests", router.requestLogs)
+			secured.Get("/logs/audit", router.auditLogs)
+			secured.Get("/sites/{siteID}/analytics/report", router.siteAnalyticsReport)
+			secured.Get("/sites/{siteID}/logs/requests", router.siteRequestLogs)
+			secured.Get("/sites/{siteID}/logs/audit", router.siteAuditLogs)
+		})
 	})
 
 	r.Handle("/*", router.uiHandler())
@@ -93,6 +122,89 @@ func metadataFromContext(ctx context.Context) requestMetadata {
 		return requestMetadata{}
 	}
 	return meta
+}
+
+func identityFromContext(ctx context.Context) (auth.Identity, bool) {
+	value := ctx.Value(identityKey{})
+	if value == nil {
+		return auth.Identity{}, false
+	}
+	identity, ok := value.(auth.Identity)
+	return identity, ok
+}
+
+func (r *Router) login(rw http.ResponseWriter, req *http.Request) {
+	var payload loginRequest
+	if err := decodeJSON(req, &payload); err != nil {
+		writeError(rw, http.StatusBadRequest, err)
+		return
+	}
+
+	identity, err := r.auth.Authenticate(payload.Username, payload.Password)
+	if err != nil {
+		writeError(rw, http.StatusUnauthorized, errors.New("invalid credentials"))
+		return
+	}
+
+	token, issued, err := r.auth.Issue(identity, time.Now().UTC())
+	if err != nil {
+		writeError(rw, http.StatusInternalServerError, err)
+		return
+	}
+
+	writeJSON(rw, http.StatusOK, authResponse{
+		Token: token,
+		User: authIdentity{
+			Username: issued.Username,
+			Role:     issued.Role,
+		},
+		ExpiresAt: issued.ExpiresAt,
+		TokenTTL:  issued.ExpiresAt.Sub(issued.IssuedAt),
+	})
+}
+
+func (r *Router) me(rw http.ResponseWriter, req *http.Request) {
+	identity, ok := identityFromContext(req.Context())
+	if !ok {
+		writeError(rw, http.StatusUnauthorized, errors.New("unauthorized"))
+		return
+	}
+	writeJSON(rw, http.StatusOK, authIdentity{
+		Username: identity.Username,
+		Role:     identity.Role,
+	})
+}
+
+func (r *Router) logout(rw http.ResponseWriter, req *http.Request) {
+	rw.WriteHeader(http.StatusNoContent)
+}
+
+func (r *Router) requireAuth(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		token, err := bearerToken(req.Header.Get("Authorization"))
+		if err != nil {
+			writeError(rw, http.StatusUnauthorized, errors.New("missing bearer token"))
+			return
+		}
+		identity, err := r.auth.Verify(token, time.Now().UTC())
+		if err != nil {
+			writeError(rw, http.StatusUnauthorized, errors.New("invalid bearer token"))
+			return
+		}
+		meta := metadataFromContext(req.Context())
+		meta.Actor = identity.Username
+		ctx := context.WithValue(req.Context(), requestMetadataKey{}, meta)
+		ctx = context.WithValue(ctx, identityKey{}, identity)
+		next.ServeHTTP(rw, req.WithContext(ctx))
+	})
+}
+
+func bearerToken(value string) (string, error) {
+	scheme, token, ok := strings.Cut(strings.TrimSpace(value), " ")
+	if !ok || !strings.EqualFold(scheme, "Bearer") || strings.TrimSpace(token) == "" {
+		return "", fmt.Errorf("invalid bearer token")
+	}
+	return strings.TrimSpace(token), nil
 }
 
 func (r *Router) recordAudit(req *http.Request, statusCode int, action string, resourceType string, resourceID string, summary string) {
