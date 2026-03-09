@@ -1,12 +1,14 @@
 import { createFileRoute } from "@tanstack/react-router";
 
 import { api } from "@/lib/api";
+import { requireAuth, withProtectedLoader } from "@/lib/auth";
 import { PageHeader } from "@/components/page-header";
 import { PlaceholderPanel } from "@/components/placeholder-panel";
 import { SiteShell } from "@/components/site-shell";
 
 export const Route = createFileRoute("/sites/$siteId/waf")({
-  loader: ({ params }) => api.getSite(params.siteId),
+  beforeLoad: ({ location }) => requireAuth(location),
+  loader: ({ location, params }) => withProtectedLoader(location, () => api.getSite(params.siteId)),
   component: SiteWafPage,
 });
 

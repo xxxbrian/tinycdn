@@ -3,6 +3,7 @@ import { startTransition, useEffect, useState } from "react";
 
 import type { AnalyticsPeriod, AnalyticsReport } from "@/types";
 import { api } from "@/lib/api";
+import { requireAuth, withProtectedLoader } from "@/lib/auth";
 import { analyticsPeriods, toTrafficSeries } from "@/lib/telemetry";
 import { BreakdownCard } from "@/components/breakdown-card";
 import { ChartAreaInteractive } from "@/components/chart-area-interactive";
@@ -18,7 +19,8 @@ import {
 } from "@/components/ui/select";
 
 export const Route = createFileRoute("/analytics")({
-  loader: () => api.analyticsReport("24h"),
+  beforeLoad: ({ location }) => requireAuth(location),
+  loader: ({ location }) => withProtectedLoader(location, () => api.analyticsReport("24h")),
   component: AnalyticsPage,
 });
 

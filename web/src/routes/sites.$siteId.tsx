@@ -2,6 +2,7 @@ import { Outlet, Link, createFileRoute, useRouterState } from "@tanstack/react-r
 import { Activity, Globe, Logs, Settings2, Shield, Workflow } from "lucide-react";
 
 import { api } from "@/lib/api";
+import { requireAuth, withProtectedLoader } from "@/lib/auth";
 import { CachePurgeSheet } from "@/components/cache-purge-sheet";
 import { ChartAreaInteractive } from "@/components/chart-area-interactive";
 import { PageHeader } from "@/components/page-header";
@@ -20,14 +21,16 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 
 export const Route = createFileRoute("/sites/$siteId")({
-  loader: async ({ params }) => {
-    const [site, report, requests] = await Promise.all([
-      api.getSite(params.siteId),
-      api.analyticsReport("24h", params.siteId),
-      api.requestLogs({ period: "24h", siteId: params.siteId, limit: 8 }),
-    ]);
-    return { site, report, requests };
-  },
+  beforeLoad: ({ location }) => requireAuth(location),
+  loader: ({ location, params }) =>
+    withProtectedLoader(location, async () => {
+      const [site, report, requests] = await Promise.all([
+        api.getSite(params.siteId),
+        api.analyticsReport("24h", params.siteId),
+        api.requestLogs({ period: "24h", siteId: params.siteId, limit: 8 }),
+      ]);
+      return { site, report, requests };
+    }),
   component: SiteOverviewPage,
 });
 

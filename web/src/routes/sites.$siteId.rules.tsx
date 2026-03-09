@@ -4,6 +4,7 @@ import { toast } from "sonner";
 
 import type { Rule } from "@/types";
 import { api } from "@/lib/api";
+import { requireAuth, withProtectedLoader } from "@/lib/auth";
 import { blankRule } from "@/lib/rule-helpers";
 import { PageHeader } from "@/components/page-header";
 import { RuleFormDrawer } from "@/components/rule-form-drawer";
@@ -11,7 +12,8 @@ import { RulesTable } from "@/components/rules-table";
 import { SiteShell } from "@/components/site-shell";
 
 export const Route = createFileRoute("/sites/$siteId/rules")({
-  loader: ({ params }) => api.getSite(params.siteId),
+  beforeLoad: ({ location }) => requireAuth(location),
+  loader: ({ location, params }) => withProtectedLoader(location, () => api.getSite(params.siteId)),
   component: SiteRulesPage,
 });
 

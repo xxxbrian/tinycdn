@@ -3,6 +3,7 @@ import { createFileRoute, useNavigate, useRouter } from "@tanstack/react-router"
 import { toast } from "sonner";
 
 import { api, toSiteInput } from "@/lib/api";
+import { requireAuth, withProtectedLoader } from "@/lib/auth";
 import { PageHeader } from "@/components/page-header";
 import { SiteForm } from "@/components/site-form";
 import { SiteShell } from "@/components/site-shell";
@@ -10,7 +11,8 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 
 export const Route = createFileRoute("/sites/$siteId/settings")({
-  loader: ({ params }) => api.getSite(params.siteId),
+  beforeLoad: ({ location }) => requireAuth(location),
+  loader: ({ location, params }) => withProtectedLoader(location, () => api.getSite(params.siteId)),
   component: SiteSettingsPage,
 });
 

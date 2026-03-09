@@ -4,6 +4,7 @@ import { Globe, Plus, Search } from "lucide-react";
 import { toast } from "sonner";
 
 import { api } from "@/lib/api";
+import { requireAuth, withProtectedLoader } from "@/lib/auth";
 import { ConsoleShell } from "@/components/console-shell";
 import { PageHeader } from "@/components/page-header";
 import { SiteForm } from "@/components/site-form";
@@ -29,7 +30,8 @@ import {
 } from "@/components/ui/table";
 
 export const Route = createFileRoute("/sites")({
-  loader: () => api.listSites(),
+  beforeLoad: ({ location }) => requireAuth(location),
+  loader: ({ location }) => withProtectedLoader(location, () => api.listSites()),
   component: SitesPage,
 });
 

@@ -86,6 +86,18 @@ export interface PurgeCacheResult {
   urls?: string[];
 }
 
+export interface AuthIdentity {
+  username: string;
+  role: string;
+}
+
+export interface LoginResponse {
+  token: string;
+  user: AuthIdentity;
+  expires_at: string;
+  token_ttl: number;
+}
+
 export type AnalyticsPeriod = "1h" | "24h" | "7d" | "30d" | "90d";
 
 export interface AnalyticsSummary {

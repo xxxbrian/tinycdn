@@ -3,6 +3,7 @@ import { startTransition, useDeferredValue, useEffect, useState } from "react";
 
 import type { AnalyticsPeriod, AuditLogPage, RequestLogPage } from "@/types";
 import { api } from "@/lib/api";
+import { requireAuth, withProtectedLoader } from "@/lib/auth";
 import { analyticsPeriods } from "@/lib/telemetry";
 import { AuditLogList } from "@/components/audit-log-list";
 import { PageHeader } from "@/components/page-header";
@@ -18,14 +19,16 @@ import {
 } from "@/components/ui/select";
 
 export const Route = createFileRoute("/sites/$siteId/logs")({
-  loader: async ({ params }) => {
-    const [site, requests, audit] = await Promise.all([
-      api.getSite(params.siteId),
-      api.requestLogs({ period: "24h", siteId: params.siteId, limit: 20 }),
-      api.auditLogs({ period: "7d", siteId: params.siteId, limit: 12 }),
-    ]);
-    return { site, requests, audit };
-  },
+  beforeLoad: ({ location }) => requireAuth(location),
+  loader: ({ location, params }) =>
+    withProtectedLoader(location, async () => {
+      const [site, requests, audit] = await Promise.all([
+        api.getSite(params.siteId),
+        api.requestLogs({ period: "24h", siteId: params.siteId, limit: 20 }),
+        api.auditLogs({ period: "7d", siteId: params.siteId, limit: 12 }),
+      ]);
+      return { site, requests, audit };
+    }),
   component: SiteLogsPage,
 });
 

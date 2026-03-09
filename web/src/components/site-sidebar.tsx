@@ -120,13 +120,7 @@ export function SiteSidebar({ site }: { site: Site }) {
         </SidebarGroup>
       </SidebarContent>
       <SidebarFooter>
-        <NavUser
-          user={{
-            name: site.name,
-            email: site.upstream.url,
-            avatar: "",
-          }}
-        />
+        <NavUser fallbackUser={{ name: "TinyCDN Admin", email: "owner" }} />
       </SidebarFooter>
     </Sidebar>
   );

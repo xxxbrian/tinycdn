@@ -4,6 +4,7 @@ import { startTransition, useEffect, useState } from "react";
 
 import type { AnalyticsPeriod, AnalyticsReport, AuditLogPage } from "@/types";
 import { api } from "@/lib/api";
+import { requireAuth, withProtectedLoader } from "@/lib/auth";
 import {
   analyticsPeriods,
   formatBytes,
@@ -37,14 +38,16 @@ import {
 } from "@/components/ui/table";
 
 export const Route = createFileRoute("/")({
-  loader: async () => {
-    const [sites, report, audit] = await Promise.all([
-      api.listSites(),
-      api.analyticsReport("24h"),
-      api.auditLogs({ period: "7d", limit: 6 }),
-    ]);
-    return { sites, report, audit };
-  },
+  beforeLoad: ({ location }) => requireAuth(location),
+  loader: ({ location }) =>
+    withProtectedLoader(location, async () => {
+      const [sites, report, audit] = await Promise.all([
+        api.listSites(),
+        api.analyticsReport("24h"),
+        api.auditLogs({ period: "7d", limit: 6 }),
+      ]);
+      return { sites, report, audit };
+    }),
   component: OverviewPage,
 });
 

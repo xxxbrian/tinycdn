@@ -2,6 +2,8 @@ import type {
   AnalyticsPeriod,
   AnalyticsReport,
   AuditLogPage,
+  AuthIdentity,
+  LoginResponse,
   PurgeCachePayload,
   PurgeCacheResult,
   ReorderPayload,
@@ -10,15 +12,29 @@ import type {
   Site,
   SiteInput,
 } from "@/types";
+import { clearAuthSession, getAuthToken, UnauthorizedError } from "@/lib/auth";
 
 async function request<T>(input: string, init?: RequestInit): Promise<T> {
+  const token = getAuthToken();
   const response = await fetch(input, {
     headers: {
       "Content-Type": "application/json",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
       ...init?.headers,
     },
     ...init,
   });
+
+  if (response.status === 401) {
+    clearAuthSession();
+    if (typeof window !== "undefined" && window.location.pathname !== "/login") {
+      const redirect = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+      const target = new URL("/login", window.location.origin);
+      target.searchParams.set("redirect", redirect);
+      window.location.assign(target.toString());
+    }
+    throw new UnauthorizedError("Authentication required");
+  }
 
   if (!response.ok) {
     const contentType = response.headers.get("content-type") ?? "";
@@ -49,6 +65,13 @@ async function request<T>(input: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
+  login: (username: string, password: string) =>
+    request<LoginResponse>("/api/auth/login", {
+      method: "POST",
+      body: JSON.stringify({ username, password }),
+    }),
+  me: () => request<AuthIdentity>("/api/auth/me"),
+  logout: () => request<void>("/api/auth/logout", { method: "POST" }),
   listSites: () => request<Site[]>("/api/sites"),
   getSite: (siteId: string) => request<Site>(`/api/sites/${siteId}`),
   createSite: (payload: SiteInput) =>

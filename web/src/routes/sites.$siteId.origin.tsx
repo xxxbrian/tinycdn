@@ -3,13 +3,15 @@ import { createFileRoute, useRouter } from "@tanstack/react-router";
 import { toast } from "sonner";
 
 import { api, toSiteInput } from "@/lib/api";
+import { requireAuth, withProtectedLoader } from "@/lib/auth";
 import { OriginForm } from "@/components/origin-form";
 import { PageHeader } from "@/components/page-header";
 import { SiteShell } from "@/components/site-shell";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 
 export const Route = createFileRoute("/sites/$siteId/origin")({
-  loader: ({ params }) => api.getSite(params.siteId),
+  beforeLoad: ({ location }) => requireAuth(location),
+  loader: ({ location, params }) => withProtectedLoader(location, () => api.getSite(params.siteId)),
   component: SiteOriginPage,
 });
 

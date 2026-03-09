@@ -70,13 +70,7 @@ export function ConsoleSidebar() {
         </SidebarGroup>
       </SidebarContent>
       <SidebarFooter>
-        <NavUser
-          user={{
-            name: "TinyCDN Admin",
-            email: "admin@tinycdn.local",
-            avatar: "",
-          }}
-        />
+        <NavUser fallbackUser={{ name: "TinyCDN Admin", email: "owner" }} />
       </SidebarFooter>
     </Sidebar>
   );

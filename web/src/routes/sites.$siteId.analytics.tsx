@@ -3,6 +3,7 @@ import { startTransition, useEffect, useState } from "react";
 
 import type { AnalyticsPeriod, AnalyticsReport } from "@/types";
 import { api } from "@/lib/api";
+import { requireAuth, withProtectedLoader } from "@/lib/auth";
 import { analyticsPeriods, toTrafficSeries } from "@/lib/telemetry";
 import { BreakdownCard } from "@/components/breakdown-card";
 import { ChartAreaInteractive } from "@/components/chart-area-interactive";
@@ -18,13 +19,15 @@ import {
 } from "@/components/ui/select";
 
 export const Route = createFileRoute("/sites/$siteId/analytics")({
-  loader: async ({ params }) => {
-    const [site, report] = await Promise.all([
-      api.getSite(params.siteId),
-      api.analyticsReport("24h", params.siteId),
-    ]);
-    return { site, report };
-  },
+  beforeLoad: ({ location }) => requireAuth(location),
+  loader: ({ location, params }) =>
+    withProtectedLoader(location, async () => {
+      const [site, report] = await Promise.all([
+        api.getSite(params.siteId),
+        api.analyticsReport("24h", params.siteId),
+      ]);
+      return { site, report };
+    }),
   component: SiteAnalyticsPage,
 });
 
